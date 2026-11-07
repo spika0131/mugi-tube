@@ -66,10 +66,10 @@ export const DEFAULT_INVIDIOUS = [
   'https://yewtu.be',
 ];
 // 2026-11-08計測で vid.puffyan.us / inv.us.projectsegfau.lt は6秒タイムアウトで応答なしのため除外
-export const DEFAULT_PIPED = [
-  'https://piped.video',
-];
-// 2026-11-08計測で pipedapi.kavin.rocks は526、pipedapi-libre.kavin.rocks / pipedapi.privatemelon.org は応答なしのため除外
+// 2026-11-08計測で pipedapi.kavin.rocks は526、pipedapi-libre.kavin.rocks / pipedapi.privatemelon.org は応答なし、
+// piped.video はAPIではなくフロントエンド（/streams がHTMLを返す）のため除外。現在、動作するPiped APIのデフォルトはない。
+// ユーザーが設定で独自のPipedインスタンスを追加すれば、フォールバックとして使われる。
+export const DEFAULT_PIPED: string[] = [];
 export function defaultEndpoints(): ApiEndpoint[] {
   const inv = (process.env.INVIDIOUS_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
   const pip = (process.env.PIPED_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);

@@ -7,7 +7,7 @@ function sortFormats(formats: VideoFormat[]): VideoFormat[] {
   return [...formats].sort((a, b) => rank(a) - rank(b));
 }
 
-export function Html5Player({ formats, captions, poster, title }: { formats: VideoFormat[]; captions: CaptionTrack[]; poster?: string; title?: string }) {
+export function Html5Player({ formats, captions, poster, title, onAllFailed }: { formats: VideoFormat[]; captions: CaptionTrack[]; poster?: string; title?: string; onAllFailed?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sorted = sortFormats(formats);
@@ -66,6 +66,7 @@ export function Html5Player({ formats, captions, poster, title }: { formats: Vid
       return;
     }
     setError('再生中にエラーが発生しました。別の形式も試しましたが再生できませんでした。設定から公式埋め込みプレイヤーへの切り替えもできます。');
+    onAllFailed?.();
   };
   const toggle = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play().catch(() => handleError()); else v.pause(); };
   const seek = (s: number) => { const v = videoRef.current; if (v) v.currentTime = s; };

@@ -46,6 +46,11 @@ function WatchBody({ data }: { data: PlayerData }) {
   const { setMini } = useMini();
   const [showDesc, setShowDesc] = useState(false);
   const [playlistName, setPlaylistName] = useState('');
+  // 独自HTML5プレイヤーの全形式が死んだら、公式埋め込みへ自動で切り替える。
+  // 公開Invidiousインスタンス側で MP4 / DASH / HLS が全部 403 になることがあり、
+  // そのままでは何も見れないため。埋め込みは公式の再生方法で、設定の切替より優先して救済する。
+  const [autoEmbed, setAutoEmbed] = useState(false);
+  const useEmbed = store.settings.player === 'embed' || autoEmbed;
   useEffect(() => { recordHistory(video); }, [video.videoId]);
   const fav = isFav(video.videoId);
   const addToPlaylist = () => {
@@ -60,13 +65,14 @@ function WatchBody({ data }: { data: PlayerData }) {
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <div>
-        {store.settings.player === 'embed' ? (
+        {useEmbed ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} />
+          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => setAutoEmbed(true)} />
         ) : (
-          <div className="grid aspect-video place-items-center rounded-2xl bg-black text-sm text-red-300">再生可能な形式が見つかりませんでした。設定から公式埋め込みプレイヤーに切り替えてください。</div>
+          <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         )}
+        {autoEmbed && <p className="mt-2 text-xs text-neutral-400">独自プレイヤーでの再生ができなかったため、公式埋め込みで再生しています。設定からいつでも独自プレイヤーに戻せます。</p>}
         <h1 className="mt-4 text-xl font-bold leading-snug">{video.title}</h1>
         <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-neutral-400">
           <Link href={video.authorId ? `/channel/${video.authorId}` : '#'} className="font-medium text-white hover:text-wakame">{video.author}</Link>
