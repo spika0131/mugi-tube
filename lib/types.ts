@@ -64,15 +64,12 @@ export const DEFAULT_INVIDIOUS = [
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
   'https://yewtu.be',
-  'https://vid.puffyan.us',
-  'https://inv.us.projectsegfau.lt',
 ];
+// 2026-11-08計測で vid.puffyan.us / inv.us.projectsegfau.lt は6秒タイムアウトで応答なしのため除外
 export const DEFAULT_PIPED = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi-libre.kavin.rocks',
-  'https://pipedapi.privatemelon.org',
   'https://piped.video',
 ];
+// 2026-11-08計測で pipedapi.kavin.rocks は526、pipedapi-libre.kavin.rocks / pipedapi.privatemelon.org は応答なしのため除外
 export function defaultEndpoints(): ApiEndpoint[] {
   const inv = (process.env.INVIDIOUS_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
   const pip = (process.env.PIPED_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);

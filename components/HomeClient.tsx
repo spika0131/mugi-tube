@@ -5,7 +5,7 @@ import { VideoCard } from '@/components/VideoCard';
 import type { Video } from '@/lib/types';
 
 const FEED_CACHE_KEY = 'mugi-tube-feed-v1';
-const FEED_CACHE_TTL = 5 * 60 * 1000;
+const FEED_CACHE_TTL = 10 * 60 * 1000;
 
 function loadFeedCache(): { videos: Video[]; source: string } | null {
   try {

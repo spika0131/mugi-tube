@@ -27,17 +27,38 @@ async function tryEndpoints<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoint) =
   }
   throw new Error(errors.join(' | ') || 'all endpoints failed');
 }
-// わかめtube / チョコtube型の軽量サイトと同じ考え方: 遅いインスタンスを順番に待たず、
-// 上位3件を並列で叩いて一番早く返ってきたものを採用する。全部ダメな時だけ残りを順番に試す。
+// 無料でできる高速化: インスタンスごとの実測レイテンシを覚えて速い順に試す。
+// 失敗したインスタンスは60秒間だけ後回しにする（毎回全インスタンスを叩かない）。
+const scores = new Map<string, { ms: number; at: number; failed: boolean }>();
+function orderByScore(eps: ApiEndpoint[]): ApiEndpoint[] {
+  const now = Date.now();
+  return [...eps].sort((a, b) => {
+    const sa = scores.get(a.baseUrl), sb = scores.get(b.baseUrl);
+    const fa = sa?.failed && now - sa.at < 60_000, fb = sb?.failed && now - sb.at < 60_000;
+    if (fa !== fb) return fa ? 1 : -1;
+    return (sa?.ms ?? 1500) - (sb?.ms ?? 1500);
+  });
+}
 async function tryEndpointsFast<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoint) => Promise<T>, timeoutMs = 4000): Promise<{ data: T; source: string }> {
-  const enabled = endpoints.filter(e => e.enabled);
+  const enabled = orderByScore(endpoints.filter(e => e.enabled));
   const batch = enabled.slice(0, 3);
   const rest = enabled.slice(3);
+  const timed = (ep: ApiEndpoint) => (async () => {
+    const t0 = Date.now();
+    try {
+      const data = await fn(ep);
+      scores.set(ep.baseUrl, { ms: Date.now() - t0, at: Date.now(), failed: false });
+      return data;
+    } catch (e) {
+      scores.set(ep.baseUrl, { ms: 9999, at: Date.now(), failed: true });
+      throw e;
+    }
+  })();
   if (batch.length > 1) {
     try {
       const raced = await Promise.any(batch.map(async (ep) => {
         const data = await Promise.race([
-          fn(ep),
+          timed(ep),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('race timeout')), timeoutMs)),
         ]);
         return { data, source: `${ep.kind}:${ep.baseUrl}` };
@@ -89,7 +110,7 @@ export async function searchVideos(query: string, sort: string, page?: string | 
     });
     const results = (Array.isArray(data) ? data : []).map(normInvVideo).filter(Boolean) as Video[];
     const out: SearchResponse = { query, results, nextPage: null, source };
-    setCached(key, out, 180_000); return out;
+    setCached(key, out, 300_000); return out;
   } catch (_) { /* fall through to Piped */ }
   const { data, source } = await tryEndpointsFast(endpoints.filter(e => e.kind === 'piped'), async (ep) => {
     const filter = sort === 'date' ? 'date' : sort === 'views' ? 'views' : 'all';
@@ -99,7 +120,7 @@ export async function searchVideos(query: string, sort: string, page?: string | 
   const items = data.items || data.content || [];
   const results = items.map(normPipedVideo).filter(Boolean) as Video[];
   const out: SearchResponse = { query, results, nextPage: data.nextpage || null, source };
-  setCached(key, out, 180_000); return out;
+  setCached(key, out, 300_000); return out;
 }
 export async function getFeed(): Promise<{ videos: Video[]; source: string }> {
   const key = 'feed:popular';
@@ -109,12 +130,12 @@ export async function getFeed(): Promise<{ videos: Video[]; source: string }> {
     const { data, source } = await tryEndpointsFast(endpoints.filter(e => e.kind === 'invidious'), async (ep) => fetchJson(`${ep.baseUrl}/api/v1/popular`, 5000));
     const videos = (Array.isArray(data) ? data : []).map(normInvVideo).filter(Boolean) as Video[];
     // 初回表示は24件に絞る（サムネイル40枚同時読み込みを避ける）
-    if (videos.length) { const out = { videos: videos.slice(0, 24), source }; setCached(key, out, 300_000); return out; }
+    if (videos.length) { const out = { videos: videos.slice(0, 24), source }; setCached(key, out, 600_000); return out; }
     throw new Error('empty popular feed');
   } catch (_) { /* fall through */ }
   const { data, source } = await tryEndpointsFast(endpoints.filter(e => e.kind === 'piped'), async (ep) => fetchJson(`${ep.baseUrl}/trending?region=JP`, 5000));
   const videos = (Array.isArray(data) ? data : []).map(normPipedVideo).filter(Boolean) as Video[];
-  const out = { videos: videos.slice(0, 24), source }; setCached(key, out, 300_000); return out;
+  const out = { videos: videos.slice(0, 24), source }; setCached(key, out, 600_000); return out;
 }
 export async function getSuggestions(query: string): Promise<string[]> {
   try {
@@ -164,7 +185,7 @@ export async function getVideo(id: string): Promise<PlayerData> {
     const { formats, captions } = invFormats(data);
     const related = (data.recommendedVideos || []).map(normInvVideo).filter(Boolean) as Video[];
     const out: PlayerData = { videoId: id, video, formats, captions, duration: data.lengthSeconds, source, related };
-    setCached(key, out, 180_000); return out;
+    setCached(key, out, 300_000); return out;
   } catch (e) { console.error('[getVideo invidious failed]', e); /* fall through */ }
   const { data, source } = await tryEndpointsFast(endpoints.filter(e => e.kind === 'piped'), async (ep) => fetchJson(`${ep.baseUrl}/streams/${id}`, 6000));
   const video: Video = {
@@ -174,7 +195,7 @@ export async function getVideo(id: string): Promise<PlayerData> {
   const { formats, captions } = pipedFormats(data);
   const related = (data.relatedStreams || []).map(normPipedVideo).filter(Boolean) as Video[];
   const out: PlayerData = { videoId: id, video, formats, captions, duration: data.duration, source, related };
-  setCached(key, out, 180_000); return out;
+  setCached(key, out, 300_000); return out;
 }
 export async function getChannel(id: string, sort: string): Promise<ChannelInfo> {
   const key = `channel:${id}:${sort}`;
