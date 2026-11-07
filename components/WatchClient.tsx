@@ -7,7 +7,39 @@ import { useStore, useFavorites, useMini, recordHistory } from '@/lib/store';
 import { formatViews, timeAgo } from '@/lib/types';
 import type { PlayerData } from '@/lib/types';
 
-export function WatchClient({ data }: { data: PlayerData }) {
+export function WatchClient({ videoId }: { videoId: string }) {
+  const [data, setData] = useState<PlayerData | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setError(''); setData(null);
+    fetch(`/api/video/${encodeURIComponent(videoId)}`)
+      .then(r => r.json())
+      .then(j => { if (cancelled) return; if (j.error) { setError(j.error); return; } setData(j); })
+      .catch(e => { if (!cancelled) setError(e?.message || '動画情報を取得できませんでした'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [videoId]);
+
+  if (loading) {
+    return (
+      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        <div>
+          <div className="aspect-video animate-pulse rounded-2xl bg-neutral-800" />
+          <div className="mt-4 h-6 w-3/4 animate-pulse rounded bg-neutral-800" />
+          <div className="mt-2 h-4 w-1/2 animate-pulse rounded bg-neutral-800" />
+        </div>
+        <aside><div className="space-y-3">{Array.from({ length: 4 }).map((_, i) => <div key={i} className="h-20 animate-pulse rounded-xl bg-neutral-800" />)}</div></aside>
+      </div>
+    );
+  }
+  if (error || !data) return <div className="rounded-xl border border-red-900 bg-red-950/50 p-6 text-sm text-red-200">動画を読み込めませんでした。<br />{error}<br />設定の「動画API」で別のインスタンスを試すか、公式埋め込みプレイヤーへの切り替えもできます。</div>;
+  return <WatchBody data={data} />;
+}
+
+function WatchBody({ data }: { data: PlayerData }) {
   const { video, formats, captions, related, source } = data;
   const { store, update } = useStore();
   const { isFav, toggleFav } = useFavorites();

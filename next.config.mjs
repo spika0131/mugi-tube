@@ -1,6 +1,15 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // サムネイル配信元への preconnect を Link ヘッダーで送る（初回表示の DNS/TLS 待ちを減らす）
+  async headers() {
+    return [{
+      source: '/:path*',
+      headers: [
+        { key: 'Link', value: '<https://i.ytimg.com>; rel=preconnect; crossorigin, <https://yt.chocolatemoo53.com>; rel=preconnect' },
+      ],
+    }];
+  },
   images: {
     remotePatterns: [
       { protocol: 'https', hostname: '**.ytimg.com' },

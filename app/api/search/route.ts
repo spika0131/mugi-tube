@@ -6,6 +6,6 @@ export async function GET(req: NextRequest) {
   const sort = req.nextUrl.searchParams.get('sort') || 'relevance';
   const page = req.nextUrl.searchParams.get('page');
   if (!q.trim()) return NextResponse.json({ query: q, results: [], nextPage: null, source: 'none' });
-  try { return NextResponse.json(await searchVideos(q, sort, page)); }
+  try { return NextResponse.json(await searchVideos(q, sort, page), { headers: { 'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=120' } }); }
   catch (e: any) { return NextResponse.json({ query: q, results: [], nextPage: null, source: 'none', error: e?.message || 'search failed' }, { status: 502 }); }
 }
