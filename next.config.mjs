@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // youtubei.js はサーバー側でのみ使う（バンドルせず node_modules から直接読み込む）
+  experimental: { serverComponentsExternalPackages: ['youtubei.js'] },
   // サムネイル配信元への preconnect を Link ヘッダーで送る（初回表示の DNS/TLS 待ちを減らす）
   async headers() {
     return [{

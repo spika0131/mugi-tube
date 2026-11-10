@@ -39,6 +39,26 @@ export function WatchClient({ videoId }: { videoId: string }) {
   return <WatchBody data={data} />;
 }
 
+type PlayMode = 'html5' | 'education' | 'embed';
+
+function EducationPlayer({ videoId, title }: { videoId: string; title: string }) {
+  const [src, setSrc] = useState('');
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/edu').then(r => r.json()).then(j => {
+      if (cancelled) return;
+      if (!j.params) { setFailed(true); return; }
+      const p = String(j.params);
+      setSrc(`https://www.youtubeeducation.com/embed/${videoId}${p.startsWith('?') ? p : `?${p}`}&playlist=${videoId}`);
+    }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [videoId]);
+  if (failed) return <div className="grid aspect-video w-full place-items-center rounded-2xl bg-black p-6 text-center text-sm text-neutral-300">Education再生の準備に失敗しました。下の「公式埋め込み」に切り替えてみてください。</div>;
+  if (!src) return <div className="grid aspect-video w-full place-items-center rounded-2xl bg-black text-sm text-neutral-400">Education再生を準備中…</div>;
+  return <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={src} title={title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>;
+}
+
 function WatchBody({ data }: { data: PlayerData }) {
   const { video, formats, captions, related, source } = data;
   const { store, update } = useStore();
@@ -46,11 +66,12 @@ function WatchBody({ data }: { data: PlayerData }) {
   const { setMini } = useMini();
   const [showDesc, setShowDesc] = useState(false);
   const [playlistName, setPlaylistName] = useState('');
-  // 独自HTML5プレイヤーの全形式が死んだら、公式埋め込みへ自動で切り替える。
-  // 公開Invidiousインスタンス側で MP4 / DASH / HLS が全部 403 になることがあり、
-  // そのままでは何も見れないため。埋め込みは公式の再生方法で、設定の切替より優先して救済する。
-  const [autoEmbed, setAutoEmbed] = useState(false);
-  const useEmbed = store.settings.player === 'embed' || autoEmbed;
+  // 再生方法は3つから選べる（設定の既定値で初期化し、このページでは手動切替も可能）:
+  // 独自HTML5（Invidious中継が本命）→ Education（youtubeeducation.com埋め込み）→ 公式埋め込み。
+  // 独自プレイヤーの全形式が死んだら Education へ自動で切り替える（公式埋め込みは
+  // youtube-nocookie.com が規制される環境では通らないため、その手前で Education を挟む）。
+  const [mode, setMode] = useState<PlayMode>(store.settings.player);
+  const [autoSwitched, setAutoSwitched] = useState(false);
   useEffect(() => { recordHistory(video); }, [video.videoId]);
   const fav = isFav(video.videoId);
   const addToPlaylist = () => {
@@ -65,14 +86,22 @@ function WatchBody({ data }: { data: PlayerData }) {
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <div>
-        {useEmbed ? (
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-neutral-400">再生方法:</span>
+          {([['html5', '独自プレイヤー'], ['education', 'Education'], ['embed', '公式埋め込み']] as [PlayMode, string][]).map(([m, label]) => (
+            <button key={m} onClick={() => { setMode(m); setAutoSwitched(false); }} className={`rounded-full px-3 py-1.5 ${mode === m ? 'bg-wakame font-bold text-black' : 'bg-card text-neutral-300'}`}>{label}</button>
+          ))}
+        </div>
+        {mode === 'education' ? (
+          <EducationPlayer videoId={video.videoId} title={video.title} />
+        ) : mode === 'embed' ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => setAutoEmbed(true)} />
+          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => { setAutoSwitched(true); setMode('education'); }} />
         ) : (
-          <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
+          <EducationPlayer videoId={video.videoId} title={video.title} />
         )}
-        {autoEmbed && <p className="mt-2 text-xs text-neutral-400">独自プレイヤーでの再生ができなかったため、公式埋め込みで再生しています。設定からいつでも独自プレイヤーに戻せます。</p>}
+        {autoSwitched && <p className="mt-2 text-xs text-neutral-400">独自プレイヤーでの再生ができなかったため、Education再生に切り替えました。上のボタンからいつでも戻せます。</p>}
         <h1 className="mt-4 text-xl font-bold leading-snug">{video.title}</h1>
         <div className="mt-2 flex flex-wrap items-center gap-3 text-sm text-neutral-400">
           <Link href={video.authorId ? `/channel/${video.authorId}` : '#'} className="font-medium text-white hover:text-wakame">{video.author}</Link>

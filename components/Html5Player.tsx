@@ -4,11 +4,12 @@ import type { VideoFormat, CaptionTrack } from '@/lib/types';
 
 function sortFormats(formats: VideoFormat[]): VideoFormat[] {
   const rank = (f: VideoFormat) => f.type === 'mp4' && f.hasAudio ? 0 : f.type === 'mp4' ? 1 : f.type === 'dash' ? 2 : 3;
-  return [...formats].sort((a, b) => rank(a) - rank(b));
+  return [...formats].sort((a, b) => rank(a) - rank(b) || (b.height || 0) - (a.height || 0));
 }
 
 export function Html5Player({ formats, captions, poster, title, onAllFailed }: { formats: VideoFormat[]; captions: CaptionTrack[]; poster?: string; title?: string; onAllFailed?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sorted = sortFormats(formats);
   const [idx, setIdx] = useState(0);
@@ -31,10 +32,28 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
     try { dashRef.current?.destroy(); } catch {}
     hlsRef.current = null; dashRef.current = null;
   };
+  // 映像と音声が別URLの形式では、隠しaudio要素を映像に同期して再生する（わかめtube Plus方式）
+  const syncAudio = useCallback((force = false) => {
+    const v = videoRef.current; const a = audioRef.current;
+    if (!v || !a || !current?.audioUrl) return;
+    a.playbackRate = v.playbackRate;
+    a.volume = v.volume; a.muted = v.muted;
+    if (force || Math.abs(a.currentTime - v.currentTime) > 0.4) {
+      try { a.currentTime = v.currentTime + 0.05; } catch {}
+    }
+    if (!v.paused && a.paused) a.play().catch(() => {});
+    if (v.paused && !a.paused) a.pause();
+  }, [current]);
   const attach = useCallback(async () => {
     const v = videoRef.current; if (!v || !current) return;
     cleanup(); setLoading(true); setError('');
     v.playbackRate = rate;
+    const a = audioRef.current;
+    if (a) {
+      a.pause();
+      if (current.audioUrl) { if (a.src !== current.audioUrl) { a.src = current.audioUrl; a.load(); } }
+      else { a.removeAttribute('src'); a.load(); }
+    }
     if (current.type === 'mp4') { v.src = current.url; v.load(); }
     else if (current.type === 'hls') {
       if (v.canPlayType('application/vnd.apple.mpegurl')) { v.src = current.url; v.load(); }
@@ -71,24 +90,30 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
   const toggle = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play().catch(() => handleError()); else v.pause(); };
   const seek = (s: number) => { const v = videoRef.current; if (v) v.currentTime = s; };
   const fmt = (s: number) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60); return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`; };
-  const mp4s = sorted.filter(f => f.type === 'mp4' && f.hasAudio);
+  const applyVolume = (vol: number, mute: boolean) => {
+    if (videoRef.current) { videoRef.current.volume = vol; videoRef.current.muted = mute; }
+    if (audioRef.current) { audioRef.current.volume = vol; audioRef.current.muted = mute; }
+  };
 
   return (
     <div ref={wrapRef} className="relative aspect-video w-full overflow-hidden rounded-2xl bg-black" onKeyDown={e => {
       if (e.key === ' ') { e.preventDefault(); toggle(); }
       if (e.key === 'ArrowRight') seek(time + 10); if (e.key === 'ArrowLeft') seek(time - 10);
-      if (e.key === 'f') wrapRef.current?.requestFullscreen?.(); if (e.key === 'm') setMuted(m => !m);
+      if (e.key === 'f') wrapRef.current?.requestFullscreen?.(); if (e.key === 'm') { const m = !muted; setMuted(m); applyVolume(volume, m); }
     }} tabIndex={0}>
       <video ref={videoRef} className="h-full w-full" poster={poster} playsInline
-        onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-        onTimeUpdate={e => setTime(e.currentTarget.currentTime)}
-        onLoadedMetadata={e => { setDuration(e.currentTarget.duration); setLoading(false); }}
-        onWaiting={() => setLoading(true)} onPlaying={() => setLoading(false)}
+        onPlay={() => { setPlaying(true); syncAudio(true); }}
+        onPause={() => { setPlaying(false); syncAudio(); }}
+        onTimeUpdate={e => { setTime(e.currentTarget.currentTime); syncAudio(); }}
+        onSeeked={() => syncAudio(true)}
+        onLoadedMetadata={e => { setDuration(e.currentTarget.duration); setLoading(false); syncAudio(true); }}
+        onWaiting={() => setLoading(true)} onPlaying={() => { setLoading(false); syncAudio(); }}
         onError={() => handleError()}
         onClick={toggle}
       >
         {showCaptions && captionLang && captions.filter(c => c.language === captionLang).map(c => <track key={c.language} kind="subtitles" src={c.url} srcLang={c.language} label={c.label} default />)}
       </video>
+      <audio ref={audioRef} preload="auto" className="hidden" />
       {loading && !error && <div className="absolute inset-0 grid place-items-center bg-black/40 text-sm">読み込み中…</div>}
       {error && (
         <div className="absolute inset-0 grid place-items-center bg-black/80 p-4 text-center">
@@ -100,14 +125,14 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <button onClick={toggle} className="rounded-full bg-white/10 px-3 py-1">{playing ? '一時停止' : '再生'}</button>
           <span className="text-xs text-neutral-300">{fmt(time)} / {fmt(duration)}</span>
-          <button onClick={() => setMuted(m => !m)} className="rounded-full bg-white/10 px-2 py-1 text-xs">{muted || volume === 0 ? 'ミュート解除' : 'ミュート'}</button>
-          <input type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume} onChange={e => { const v = Number(e.target.value); setVolume(v); setMuted(v === 0); if (videoRef.current) { videoRef.current.volume = v; videoRef.current.muted = v === 0; } }} className="w-20 accent-green-400" aria-label="音量" />
-          <select value={rate} onChange={e => { const r = Number(e.target.value); setRate(r); if (videoRef.current) videoRef.current.playbackRate = r; }} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="再生速度">
+          <button onClick={() => { const m = !muted; setMuted(m); applyVolume(volume, m); }} className="rounded-full bg-white/10 px-2 py-1 text-xs">{muted || volume === 0 ? 'ミュート解除' : 'ミュート'}</button>
+          <input type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume} onChange={e => { const v = Number(e.target.value); setVolume(v); setMuted(v === 0); applyVolume(v, v === 0); }} className="w-20 accent-green-400" aria-label="音量" />
+          <select value={rate} onChange={e => { const r = Number(e.target.value); setRate(r); if (videoRef.current) videoRef.current.playbackRate = r; if (audioRef.current) audioRef.current.playbackRate = r; }} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="再生速度">
             {[0.5, 0.75, 1, 1.25, 1.5, 2].map(r => <option key={r} value={r} className="text-black">{r}倍</option>)}
           </select>
-          {mp4s.length > 1 && (
-            <select value={idx} onChange={e => setIdx(Number(e.target.value))} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="画質">
-              {sorted.map((f, i) => <option key={i} value={i} className="text-black">{f.type.toUpperCase()} {f.qualityLabel || f.quality || ''}</option>)}
+          {sorted.length > 1 && (
+            <select value={idx} onChange={e => { setTried([]); setIdx(Number(e.target.value)); }} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="画質">
+              {sorted.map((f, i) => <option key={i} value={i} className="text-black">{f.type.toUpperCase()} {f.qualityLabel || f.quality || ''}{f.audioUrl ? '（音声分離）' : ''}</option>)}
             </select>
           )}
           {captions.length > 0 && (

@@ -15,6 +15,16 @@ YouTubeを便利に検索・視聴できる独自の動画ポータル。ダー�
 
 Next.js (App Router) + React + TypeScript + Tailwind CSS。サーバー側の Next.js API Routes がサービス層となり、Invidious / Piped のレスポンスを共通モデルに変換します。タイムアウト・AbortController・フォールバック・キャッシュ付きです。
 
+## 再生の仕組み（わかめtube Plus 方式）
+
+- Invidious の稼働インスタンス一覧は、わかめtube Plus と同じ配布リスト（toka-kun/Education）をサーバー側で取得して自動追随します（1時間キャッシュ）。
+- 動画取得は `?local=true` で行い、ストリームURLをインスタンス自身の `/videoplayback` 中継にします。ブラウザが youtube.com / googlevideo.com に触れずに再生できます。
+- 採用前にストリームURLへ Range 付きGETで「本当に映像が返るか」を実物確認します（API応答が正常でも中継がHTMLを返すインスタンスがあるため）。確認済みの結果は5分、未確認は30秒だけキャッシュします。
+- 高画質は adaptiveFormats の映像（〜1080p）と音声を分け、プレイヤーが隠し audio 要素を同期再生します。
+- Invidious / Piped が全滅した場合は youtubei.js（ANDROIDクライアントの itag 18）にフォールバックします。
+- 埋め込み系の救済として Education 再生（youtubeeducation.com、パラメータは配布元から取得）も選べます。独自プレイヤーが全滅すると自動で Education に切り替わります。
+- サムネイルは自前プロキシ `/api/img` 経由で表示します（許可ホストのみ）。
+
 ## 開発
 
 ```bash

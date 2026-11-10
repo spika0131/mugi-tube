@@ -28,11 +28,12 @@ export default function SettingsPage() {
       <h1 className="mb-6 text-2xl font-bold">設定</h1>
       <section className="mb-8 rounded-2xl bg-card p-5">
         <h2 className="mb-3 font-bold">プレイヤー</h2>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <button onClick={() => set({ player: 'html5' })} className={`rounded-full px-4 py-2 text-sm ${s.player === 'html5' ? 'bg-wakame font-bold text-black' : 'bg-neutral-800'}`}>独自HTML5プレイヤー</button>
+          <button onClick={() => set({ player: 'education' })} className={`rounded-full px-4 py-2 text-sm ${s.player === 'education' ? 'bg-wakame font-bold text-black' : 'bg-neutral-800'}`}>Educationプレイヤー</button>
           <button onClick={() => set({ player: 'embed' })} className={`rounded-full px-4 py-2 text-sm ${s.player === 'embed' ? 'bg-wakame font-bold text-black' : 'bg-neutral-800'}`}>公式埋め込みプレイヤー</button>
         </div>
-        <p className="mt-2 text-sm text-neutral-400">HTML5プレイヤーが再生できない動画は、公式埋め込みに切り替えると再生できる場合があります。</p>
+        <p className="mt-2 text-sm text-neutral-400">独自HTML5プレイヤーが再生できない動画は、自動でEducation再生（youtubeeducation.com埋め込み）に切り替わります。Educationは学校などの環境向けの埋め込みで、公式埋め込み（youtube-nocookie.com）が規制される環境でも通る場合があります。動画ページの上のボタンからも切り替えできます。</p>
       </section>
       <section className="mb-8 rounded-2xl bg-card p-5">
         <h2 className="mb-3 font-bold">表示</h2>

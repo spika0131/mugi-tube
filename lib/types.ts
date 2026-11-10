@@ -7,6 +7,9 @@ export interface VideoFormat {
   fps?: number;
   hasAudio?: boolean;
   contentLength?: number;
+  // 映像と音声が別URLの形式（Invidious adaptiveFormats）用。プレイヤーが隠しaudio要素を同期再生する
+  audioUrl?: string;
+  height?: number;
 }
 export interface CaptionTrack { label: string; language: string; url: string; }
 export interface Video {
@@ -54,16 +57,42 @@ export interface ApiEndpoint {
 }
 export interface ApiHealth { id: string; kind: string; baseUrl: string; ok: boolean; ms?: number; status?: number; error?: string; }
 export interface AppSettings {
-  player: 'html5' | 'embed';
+  player: 'html5' | 'embed' | 'education';
   layout: 'grid' | 'list';
   secretMode: boolean;
   endpoints: ApiEndpoint[];
 }
+// わかめtube Plus（toka-kun/wkt-Plus）が使う Invidious 一覧を土台にしたデフォルト。
+// 先頭2件は 2026-11-10 実測で formatStreams（音声付きMP4）を返し、?local=true で
+// インスタンス自身が中継する /videoplayback URL になることを確認済み
+// （ブラウザが googlevideo.com / youtube.com に触れずに再生できる）。
+// サーバー側では lib/api.ts が wkt-Plus と同じ配布リスト（toka-kun/Education）を
+// 取得して自動で追随するので、この配列はそのフォールバック。
 export const DEFAULT_INVIDIOUS = [
+  'https://invidious.i234.cyou',
+  'https://iv.catgirl.cloud',
   'https://yt.chocolatemoo53.com',
+  'https://yt.omada.cafe',
+  'https://echostreamz.com',
+  'https://invidious.ritoge.com',
+  'https://invidious.darkness.services',
+  'https://iv.melmac.space',
+  'https://y.com.sb',
+  'https://super8.absturztau.be',
+  'https://inv.thepixora.com',
+  'https://inv.zoomerville.com',
+  'https://invidious.ducks.party',
+  'https://inv.kamuridesu.com',
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
   'https://yewtu.be',
+  'https://invidious.materialio.us',
+  'https://invidious.tiekoetter.com',
+  'https://invidious.f5.si',
+  'https://inv.owo.si',
+  'https://inv.miningtcup.me',
+  'https://invidious.schenkel.eti.br',
+  'https://yt.thechangebook.org',
 ];
 // 2026-11-08計測で vid.puffyan.us / inv.us.projectsegfau.lt は6秒タイムアウトで応答なしのため除外
 // 2026-11-08計測で pipedapi.kavin.rocks は526、pipedapi-libre.kavin.rocks / pipedapi.privatemelon.org は応答なし、
