@@ -284,7 +284,7 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
   const tryProbe = async (ep: ApiEndpoint, d: any): Promise<boolean> => {
     const probe = probeOf(d);
     if (!probe) return false;
-    const ok = await verifyStream(probe, 3500);
+    const ok = await verifyStream(probe, 6000);
     scores.set(ep.baseUrl, ok ? { ms: 500, at: Date.now(), failed: false } : { ms: 9999, at: Date.now(), failed: true });
     return ok;
   };
@@ -294,7 +294,7 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
     const batch = ordered.slice(offset, offset + 4);
     const settled = await Promise.all(batch.map(async (ep) => {
       try {
-        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 8000);
+        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
         return hasAny(d) ? { ep, d } : null;
       } catch { return null; }
     }));
@@ -316,7 +316,7 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
   // 並列バースト中はタイムアウトしていたインスタンスが、単独だと通ることがある。
   for (const ep of ordered.slice(0, 2)) {
     try {
-      const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 8000);
+      const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
       if (hasAny(d) && await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
     } catch { /* 次へ */ }
   }
