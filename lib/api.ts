@@ -336,7 +336,10 @@ export async function getVideo(id: string): Promise<PlayerData> {
   };
   // Invidious: 実物確認が通った結果は5分、未確認の結果は30秒だけキャッシュする
   // （未確認＝たまたま再生できないインスタンスを掴んだ可能性があるため、早めに再挑戦する）
-  const inv = await fetchInvVideo(id).catch(() => null);
+  let inv = await fetchInvVideo(id).catch(() => null);
+  // 公開インスタンスは時間帯や接続元IPで成功率が揺れるため、全滅したら1回だけ再スイープする
+  // （2回目はスコア学習が効いて、速いインスタンスから試せる）
+  if (!inv) inv = await fetchInvVideo(id).catch(() => null);
   if (inv) { const out = toPlayerData(inv.data, inv.source); setCached(key, out, inv.verified ? 300_000 : 30_000); return out; }
   // 第3段階: Piped（デフォルトでは動作するインスタンスなし。設定で追加された場合のみ）
   try {
