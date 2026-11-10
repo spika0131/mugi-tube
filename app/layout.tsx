@@ -6,7 +6,12 @@ import { SearchBar } from '@/components/SearchBar';
 import { MiniPlayer } from '@/components/MiniPlayer';
 import { KeyboardShortcut } from '@/components/KeyboardShortcut';
 
-export const metadata: Metadata = { title: 'むぎTube', description: 'YouTube動画ポータル — 検索・視聴・チャンネル・お気に入り・履歴' };
+export const metadata: Metadata = {
+  // 学校用カモフラージュ: タブには「ホーム」と Google のアイコンだけ出す
+  title: 'ホーム',
+  description: 'ホーム',
+  icons: { icon: 'https://www.google.com/favicon.ico', shortcut: 'https://www.google.com/favicon.ico' },
+};
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
