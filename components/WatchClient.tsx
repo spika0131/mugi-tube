@@ -11,23 +11,40 @@ export function WatchClient({ videoId }: { videoId: string }) {
   const [data, setData] = useState<PlayerData | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [attempt, setAttempt] = useState(0);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true); setError(''); setData(null);
-    fetch(`/api/video/${encodeURIComponent(videoId)}`)
-      .then(r => r.json())
-      .then(j => { if (cancelled) return; if (j.error) { setError(j.error); return; } setData(j); })
-      .catch(e => { if (!cancelled) setError(e?.message || '動画情報を取得できませんでした'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
+    setLoading(true); setError(''); setData(null); setAttempt(0);
+    // 取得元インスタンスの成否はタイミングで揺れるため、失敗したら少し待って最大3回まで自動リトライする
+    (async () => {
+      for (let i = 0; i < 3; i++) {
+        if (cancelled) return;
+        setAttempt(i + 1);
+        try {
+          const r = await fetch(`/api/video/${encodeURIComponent(videoId)}`);
+          const j = await r.json();
+          if (cancelled) return;
+          if (!j.error && j.formats) { setData(j); setLoading(false); return; }
+          if (i === 2) { setError(j.error || '動画情報を取得できませんでした'); setLoading(false); return; }
+        } catch (e: any) {
+          if (cancelled) return;
+          if (i === 2) { setError(e?.message || '動画情報を取得できませんでした'); setLoading(false); return; }
+        }
+        await new Promise(res => setTimeout(res, 2500));
+      }
+    })();
     return () => { cancelled = true; };
-  }, [videoId]);
+  }, [videoId, reloadKey]);
 
   if (loading) {
     return (
       <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
         <div>
-          <div className="aspect-video animate-pulse rounded-2xl bg-neutral-800" />
+          <div className="relative aspect-video animate-pulse rounded-2xl bg-neutral-800">
+            {attempt > 1 && <div className="absolute inset-0 grid place-items-center text-sm text-neutral-300">取得を再試行しています…（{attempt}/3回目）</div>}
+          </div>
           <div className="mt-4 h-6 w-3/4 animate-pulse rounded bg-neutral-800" />
           <div className="mt-2 h-4 w-1/2 animate-pulse rounded bg-neutral-800" />
         </div>
@@ -35,7 +52,22 @@ export function WatchClient({ videoId }: { videoId: string }) {
       </div>
     );
   }
-  if (error || !data) return <div className="rounded-xl border border-red-900 bg-red-950/50 p-6 text-sm text-red-200">動画を読み込めませんでした。<br />{error}<br />設定の「動画API」で別のインスタンスを試すか、公式埋め込みプレイヤーへの切り替えもできます。</div>;
+  if (error || !data) {
+    // 独自プレイヤー用の取得が全滅しても行き止まりにしない：Education 再生に自動で逃がす
+    return (
+      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        <div>
+          <div className="mb-3 rounded-xl border border-amber-900 bg-amber-950/50 p-4 text-sm text-amber-200">
+            独自プレイヤー用の動画取得に失敗したため、Education再生に切り替えました。時間をおいて「もう一度試す」と独自プレイヤーで開けることもあります。
+            <button onClick={() => setReloadKey(k => k + 1)} className="ml-3 rounded-lg bg-amber-800 px-3 py-1 text-xs text-white hover:bg-amber-700">もう一度試す</button>
+            <div className="mt-1 text-xs text-amber-300/70">{error}</div>
+          </div>
+          <EducationPlayer videoId={videoId} title="動画" />
+        </div>
+        <aside />
+      </div>
+    );
+  }
   return <WatchBody data={data} />;
 }
 

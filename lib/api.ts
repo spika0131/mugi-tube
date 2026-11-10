@@ -357,8 +357,14 @@ export async function getVideo(id: string): Promise<PlayerData> {
   // ANDROIDクライアントの itag18（音声付きMP4）を使う。URLは googlevideo 直リンクになるため
   // 管理デバイスでは通らない可能性があるが、通常環境では再生でき、最低限メタデータは返せる。
   const { getVideoViaYoutubei } = await import('./youtubei');
-  const out = await getVideoViaYoutubei(id);
-  setCached(key, out, 300_000); return out;
+  try {
+    const out = await getVideoViaYoutubei(id);
+    setCached(key, out, 300_000); return out;
+  } catch (e) {
+    // youtubei も接続元や時間帯で成否が揺れるため、1回だけ試し直す
+    const out = await getVideoViaYoutubei(id);
+    setCached(key, out, 300_000); return out;
+  }
 }
 export async function getChannel(id: string, sort: string): Promise<ChannelInfo> {
   const key = `channel:${id}:${sort}`;
