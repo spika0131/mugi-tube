@@ -136,7 +136,9 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
         </div>
       )}
       {!uiVisible && duration > 0 && (
-        <div className="absolute bottom-0 left-0 h-[3px] bg-green-400" style={{ width: `${Math.min(100, (time / duration) * 100)}%` }} />
+        <div className="absolute bottom-0 left-0 right-0 h-[3px] bg-white/25">
+          <div className="h-full bg-green-400" style={{ width: `${Math.min(100, (time / duration) * 100)}%` }} />
+        </div>
       )}
       <div className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent px-3 pb-2 pt-8 transition-opacity duration-300 ${uiVisible ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
         <input type="range" min={0} max={duration || 0} step={0.1} value={time} onChange={e => seek(Number(e.target.value))} className="w-full accent-green-400" aria-label="シークバー" />
