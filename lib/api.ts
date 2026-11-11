@@ -323,8 +323,11 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
   return firstUnverified;
 }
 
-export async function getVideo(id: string): Promise<PlayerData> {
+export async function getVideo(id: string, fresh = false): Promise<PlayerData> {
   const key = `video:${id}`;
+  // fresh=true: キャッシュを捨てて取り直す（プレイヤーが全形式失敗したときの再スイープ用。
+  // 取得元インスタンスがタイミングで変わるため、別インスタンスで拾い直せることがある）
+  if (fresh) cache.delete(key);
   const hit = getCached<PlayerData>(key); if (hit) return hit;
   const toPlayerData = (data: any, source: string): PlayerData => {
     const video: Video = normInvVideo(data) || { videoId: id, title: data.title || '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: data.author || '' };

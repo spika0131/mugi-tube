@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Html5Player } from './Html5Player';
 import { VideoCard } from './VideoCard';
@@ -13,6 +13,17 @@ export function WatchClient({ videoId }: { videoId: string }) {
   const [loading, setLoading] = useState(true);
   const [attempt, setAttempt] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
+  const [useFresh, setUseFresh] = useState(false);
+  const freshUsedRef = useRef(false);
+  useEffect(() => { freshUsedRef.current = false; setUseFresh(false); }, [videoId]);
+  // プレイヤーが全形式失敗したとき、キャッシュを捨てた取り直し（別インスタンス期待）を1回だけ許可する
+  const handleRequestFresh = () => {
+    if (freshUsedRef.current) return false;
+    freshUsedRef.current = true;
+    setUseFresh(true);
+    setReloadKey(k => k + 1);
+    return true;
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -23,7 +34,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
         if (cancelled) return;
         setAttempt(i + 1);
         try {
-          const r = await fetch(`/api/video/${encodeURIComponent(videoId)}`);
+          const r = await fetch(`/api/video/${encodeURIComponent(videoId)}${useFresh ? '?fresh=1' : ''}`);
           const j = await r.json();
           if (cancelled) return;
           if (!j.error && j.formats) { setData(j); setLoading(false); return; }
@@ -36,7 +47,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [videoId, reloadKey]);
+  }, [videoId, reloadKey, useFresh]);
 
   if (loading) {
     return (
@@ -68,7 +79,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
       </div>
     );
   }
-  return <WatchBody data={data} />;
+  return <WatchBody key={reloadKey} data={data} onRequestFresh={handleRequestFresh} />;
 }
 
 type PlayMode = 'html5' | 'education' | 'embed';
@@ -91,7 +102,7 @@ function EducationPlayer({ videoId, title }: { videoId: string; title: string })
   return <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={src} title={title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>;
 }
 
-function WatchBody({ data }: { data: PlayerData }) {
+function WatchBody({ data, onRequestFresh }: { data: PlayerData; onRequestFresh?: () => boolean }) {
   const { video, formats, captions, related, source } = data;
   const { store, update } = useStore();
   const { isFav, toggleFav } = useFavorites();
@@ -129,7 +140,7 @@ function WatchBody({ data }: { data: PlayerData }) {
         ) : mode === 'embed' ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => { setAutoSwitched(true); setMode('education'); }} />
+          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => { if (onRequestFresh && onRequestFresh()) return; setAutoSwitched(true); setMode('education'); }} />
         ) : (
           <EducationPlayer videoId={video.videoId} title={video.title} />
         )}
