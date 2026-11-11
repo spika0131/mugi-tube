@@ -24,6 +24,9 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
   const [tried, setTried] = useState<number[]>([]);
   const [captionLang, setCaptionLang] = useState('');
   const [showCaptions, setShowCaptions] = useState(false);
+  // 操作UIは再生中に数秒触らないと自動で消して映像の邪魔をしない（YouTube方式）
+  const [uiVisible, setUiVisible] = useState(true);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hlsRef = useRef<any>(null); const dashRef = useRef<any>(null);
   const current = sorted[idx];
 
@@ -94,9 +97,21 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
     if (videoRef.current) { videoRef.current.volume = vol; videoRef.current.muted = mute; }
     if (audioRef.current) { audioRef.current.volume = vol; audioRef.current.muted = mute; }
   };
+  const pokeUi = useCallback(() => {
+    setUiVisible(true);
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    const v = videoRef.current;
+    if (v && !v.paused && !v.ended) hideTimer.current = setTimeout(() => setUiVisible(false), 2500);
+  }, []);
+  useEffect(() => {
+    if (!playing) { setUiVisible(true); if (hideTimer.current) clearTimeout(hideTimer.current); }
+    else pokeUi();
+  }, [playing, pokeUi]);
+  useEffect(() => () => { if (hideTimer.current) clearTimeout(hideTimer.current); }, []);
 
   return (
-    <div ref={wrapRef} className="relative aspect-video w-full overflow-hidden rounded-2xl bg-black" onKeyDown={e => {
+    <div ref={wrapRef} className={`relative aspect-video w-full overflow-hidden rounded-2xl bg-black ${!uiVisible && playing ? 'cursor-none' : ''}`} onMouseMove={pokeUi} onTouchStart={pokeUi} onKeyDown={e => {
+      pokeUi();
       if (e.key === ' ') { e.preventDefault(); toggle(); }
       if (e.key === 'ArrowRight') seek(time + 10); if (e.key === 'ArrowLeft') seek(time - 10);
       if (e.key === 'f') wrapRef.current?.requestFullscreen?.(); if (e.key === 'm') { const m = !muted; setMuted(m); applyVolume(volume, m); }
@@ -120,7 +135,10 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
           <div><p className="text-sm text-red-300">{error}</p><button className="mt-3 rounded-full bg-wakame px-4 py-2 text-sm font-bold text-black" onClick={() => { setTried([]); setIdx(0); setError(''); attach(); }}>再試行</button></div>
         </div>
       )}
-      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent px-3 pb-2 pt-8">
+      {!uiVisible && duration > 0 && (
+        <div className="absolute bottom-0 left-0 h-[3px] bg-green-400" style={{ width: `${Math.min(100, (time / duration) * 100)}%` }} />
+      )}
+      <div className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent px-3 pb-2 pt-8 transition-opacity duration-300 ${uiVisible ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
         <input type="range" min={0} max={duration || 0} step={0.1} value={time} onChange={e => seek(Number(e.target.value))} className="w-full accent-green-400" aria-label="シークバー" />
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <button onClick={toggle} className="rounded-full bg-white/10 px-3 py-1">{playing ? '一時停止' : '再生'}</button>
@@ -141,7 +159,7 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
               {captions.map(c => <option key={c.language} value={c.language} className="text-black">{c.label}</option>)}
             </select>
           )}
-          <span className="ml-auto text-[11px] text-neutral-400">{current?.type.toUpperCase()} • {title || ''}</span>
+          <span className="ml-auto text-[11px] text-neutral-400">{current?.type.toUpperCase()} {current?.qualityLabel || ''}</span>
           <button onClick={() => wrapRef.current?.requestFullscreen?.()} className="rounded-full bg-white/10 px-3 py-1">全画面</button>
         </div>
       </div>
