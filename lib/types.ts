@@ -37,6 +37,9 @@ export interface PlayerData {
   duration?: number;
   source: string;
   related?: Video[];
+  // 複数の取得元が「再生不可」と返したため即確定した理由（メンバー限定・非公開など）。
+  // 付いている場合は formats は空で、クライアントは無駄なリトライをせず Education 等へ進む。
+  unavailable?: string;
 }
 export interface ChannelInfo {
   authorId: string;

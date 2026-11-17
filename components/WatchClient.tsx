@@ -14,12 +14,23 @@ export function WatchClient({ videoId }: { videoId: string }) {
   const [attempt, setAttempt] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
   const [useFresh, setUseFresh] = useState(false);
-  const freshUsedRef = useRef(false);
-  useEffect(() => { freshUsedRef.current = false; setUseFresh(false); }, [videoId]);
-  // プレイヤーが全形式失敗したとき、キャッシュを捨てた取り直し（別インスタンス期待）を1回だけ許可する
-  const handleRequestFresh = () => {
-    if (freshUsedRef.current) return false;
-    freshUsedRef.current = true;
+  // 再生失敗した取得元を除外して別ソースを取り直す（Choco-Tube-Plus の exclude 方式）。
+  // 失敗元は最大2回まで切り替え、再生位置は resumeAt で新しいプレイヤーに引き継ぐ。
+  const [excludeHosts, setExcludeHosts] = useState<string[]>([]);
+  const [resumeAt, setResumeAt] = useState(0);
+  const switchCountRef = useRef(0);
+  const dataRef = useRef<PlayerData | null>(null);
+  useEffect(() => { dataRef.current = data; }, [data]);
+  useEffect(() => {
+    switchCountRef.current = 0; setUseFresh(false); setExcludeHosts([]); setResumeAt(0);
+  }, [videoId]);
+  const handleRequestAlt = (time: number) => {
+    if (switchCountRef.current >= 2) return false;
+    switchCountRef.current += 1;
+    const src = dataRef.current?.source || '';
+    const m = src.match(/^(?:invidious|piped):(https?:\/\/.+)$/);
+    if (m) setExcludeHosts(prev => (prev.includes(m[1]) ? prev : [...prev, m[1]]));
+    if (time > 0) setResumeAt(time);
     setUseFresh(true);
     setReloadKey(k => k + 1);
     return true;
@@ -28,13 +39,25 @@ export function WatchClient({ videoId }: { videoId: string }) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true); setError(''); setData(null); setAttempt(0);
-    // 取得元インスタンスの成否はタイミングで揺れるため、失敗したら少し待って最大3回まで自動リトライする
+    // 取得元インスタンスの成否はタイミングで揺れるため、失敗したら少し待って最大3回まで自動リトライする。
+    // 待機は回数で延ばし、少しランダムにずらす（同時リトライの集中とレート制限の悪化を防ぐ。
+    // siatube のリトライ規律を参考）。自前APIが 429 と Retry-After を返したらそれを尊重する。
     (async () => {
       for (let i = 0; i < 3; i++) {
         if (cancelled) return;
         setAttempt(i + 1);
+        let waitMs = 2500 * (i + 1) + Math.floor(Math.random() * 800);
         try {
-          const r = await fetch(`/api/video/${encodeURIComponent(videoId)}${useFresh ? '?fresh=1' : ''}`);
+          const params = new URLSearchParams();
+          if (useFresh) params.set('fresh', '1');
+          if (excludeHosts.length) params.set('exclude', excludeHosts.join(','));
+          const qs = params.toString();
+          const r = await fetch(`/api/video/${encodeURIComponent(videoId)}${qs ? `?${qs}` : ''}`);
+          if (r.status === 429) {
+            const ra = Number(r.headers.get('retry-after'));
+            if (Number.isFinite(ra) && ra > 0) waitMs = Math.min(ra * 1000, 15000);
+            throw new Error('rate limited');
+          }
           const j = await r.json();
           if (cancelled) return;
           if (!j.error && j.formats) { setData(j); setLoading(false); return; }
@@ -43,11 +66,11 @@ export function WatchClient({ videoId }: { videoId: string }) {
           if (cancelled) return;
           if (i === 2) { setError(e?.message || '動画情報を取得できませんでした'); setLoading(false); return; }
         }
-        await new Promise(res => setTimeout(res, 2500));
+        await new Promise(res => setTimeout(res, waitMs));
       }
     })();
     return () => { cancelled = true; };
-  }, [videoId, reloadKey, useFresh]);
+  }, [videoId, reloadKey, useFresh, excludeHosts]);
 
   if (loading) {
     return (
@@ -70,7 +93,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
         <div>
           <div className="mb-3 rounded-xl border border-amber-900 bg-amber-950/50 p-4 text-sm text-amber-200">
             独自プレイヤー用の動画取得に失敗したため、Education再生に切り替えました。時間をおいて「もう一度試す」と独自プレイヤーで開けることもあります。
-            <button onClick={() => setReloadKey(k => k + 1)} className="ml-3 rounded-lg bg-amber-800 px-3 py-1 text-xs text-white hover:bg-amber-700">もう一度試す</button>
+            <button onClick={() => { setUseFresh(true); setReloadKey(k => k + 1); }} className="ml-3 rounded-lg bg-amber-800 px-3 py-1 text-xs text-white hover:bg-amber-700">もう一度試す</button>
             <div className="mt-1 text-xs text-amber-300/70">{error}</div>
           </div>
           <EducationPlayer videoId={videoId} title="動画" />
@@ -79,7 +102,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
       </div>
     );
   }
-  return <WatchBody key={reloadKey} data={data} onRequestFresh={handleRequestFresh} />;
+  return <WatchBody key={reloadKey} data={data} resumeAt={resumeAt} onRequestAlt={handleRequestAlt} />;
 }
 
 type PlayMode = 'html5' | 'education' | 'embed';
@@ -102,8 +125,22 @@ function EducationPlayer({ videoId, title }: { videoId: string; title: string })
   return <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={src} title={title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>;
 }
 
-function WatchBody({ data, onRequestFresh }: { data: PlayerData; onRequestFresh?: () => boolean }) {
+function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeAt?: number; onRequestAlt?: (time: number) => boolean }) {
   const { video, formats, captions, related, source } = data;
+  // 複数の取得元が「再生不可」と申告した動画は、独自プレイヤーを回さず理由を添えて Education へ
+  if (data.unavailable) {
+    return (
+      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        <div>
+          <div className="mb-3 rounded-xl border border-amber-900 bg-amber-950/50 p-4 text-sm text-amber-200">
+            この動画は取得元で「再生不可」と判定されました（{data.unavailable}）。Education再生で開けるか試せます。
+          </div>
+          <EducationPlayer videoId={data.videoId} title={video.title || '動画'} />
+        </div>
+        <aside />
+      </div>
+    );
+  }
   const { store, update } = useStore();
   const { isFav, toggleFav } = useFavorites();
   const { setMini } = useMini();
@@ -140,7 +177,7 @@ function WatchBody({ data, onRequestFresh }: { data: PlayerData; onRequestFresh?
         ) : mode === 'embed' ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} onAllFailed={() => { if (onRequestFresh && onRequestFresh()) return; setAutoSwitched(true); setMode('education'); }} />
+          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} startAt={resumeAt} onAllFailed={(t) => { if (onRequestAlt && onRequestAlt(t)) return; setAutoSwitched(true); setMode('education'); }} />
         ) : (
           <EducationPlayer videoId={video.videoId} title={video.title} />
         )}

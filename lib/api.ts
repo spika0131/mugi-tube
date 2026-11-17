@@ -17,7 +17,16 @@ export async function fetchJson(url: string, timeoutMs = 8000): Promise<any> {
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json', 'User-Agent': 'mugi-tube/0.1' }, cache: 'no-store' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      // ステータスと Retry-After、エラーボディを例外に載せる（429クールダウン判定と
+      // 「再生不可」の即確定分類に使う。siatube のリトライ規律を参考にした）
+      const err: any = new Error(`HTTP ${res.status}`);
+      err.status = res.status;
+      const ra = Number(res.headers.get('retry-after'));
+      if (Number.isFinite(ra) && ra > 0) err.retryAfterSec = ra;
+      try { err.body = await res.text(); } catch { /* bodyなしでもよい */ }
+      throw err;
+    }
     return await res.json();
   } finally { clearTimeout(t); }
 }
@@ -34,13 +43,24 @@ async function tryEndpoints<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoint) =
 // 無料でできる高速化: インスタンスごとの実測レイテンシを覚えて速い順に試す。
 // 失敗したインスタンスは60秒間だけ後回しにする（毎回全インスタンスを叩かない）。
 const scores: Map<string, { ms: number; at: number; failed: boolean }> = __g.__mugiScores || (__g.__mugiScores = new Map());
+// 429（レート制限）を受けたインスタンスのクールダウン期限。相手が指定した
+// Retry-After を尊重し、その間は後回しにして制限を悪化させない（siatube の規律を参考）
+const cooldowns: Map<string, number> = __g.__mugiCooldowns || (__g.__mugiCooldowns = new Map());
+function noteFailure(baseUrl: string, e: any) {
+  scores.set(baseUrl, { ms: 9999, at: Date.now(), failed: true });
+  if (e?.status === 429) {
+    const sec = Math.min(Math.max(Number(e?.retryAfterSec) || 30, 5), 180);
+    cooldowns.set(baseUrl, Date.now() + sec * 1000);
+  }
+}
 function orderByScore(eps: ApiEndpoint[]): ApiEndpoint[] {
   const now = Date.now();
   return [...eps].sort((a, b) => {
     const sa = scores.get(a.baseUrl), sb = scores.get(b.baseUrl);
     // 注意: !! で boolean に揃えること。false と undefined を混ぜると比較関数が
     // 矛盾し（両方向で -1 を返す）、ソート結果が不定になって速いインスタンスが後ろへ行く。
-    const fa = !!(sa?.failed && now - sa.at < 60_000), fb = !!(sb?.failed && now - sb.at < 60_000);
+    const fa = !!((sa?.failed && now - sa.at < 60_000) || (cooldowns.get(a.baseUrl) || 0) > now);
+    const fb = !!((sb?.failed && now - sb.at < 60_000) || (cooldowns.get(b.baseUrl) || 0) > now);
     if (fa !== fb) return fa ? 1 : -1;
     return (sa?.ms ?? 1500) - (sb?.ms ?? 1500);
   });
@@ -56,7 +76,7 @@ async function tryEndpointsFast<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoin
       scores.set(ep.baseUrl, { ms: Date.now() - t0, at: Date.now(), failed: false });
       return data;
     } catch (e) {
-      scores.set(ep.baseUrl, { ms: 9999, at: Date.now(), failed: true });
+      noteFailure(ep.baseUrl, e);
       throw e;
     }
   })();
@@ -269,11 +289,24 @@ async function verifyStream(url: string, timeoutMs = 4500): Promise<boolean> {
 // 1バッチ目で確認が通らなければ2バッチ目（次の6件）も試す。
 // それでも全滅したら、最初の候補を最後の望みとして返す（ブラウザ側のフォールバックに委ねる）。
 export interface InvVideoResult { data: any; source: string; verified: boolean }
+// 「再生不可」の即確定分類（siatube の VIDEO_STREAM_ERROR_CODES を参考）:
+// 1インスタンスの申告だけでは確定しない（地域制限など取得元で結果が違うため）。
+// 複数（3件以上）が独立に同じ申告をしたら、動画側の状態として確定させる。
+const UNAVAILABLE_RE = /unavailable|not available|private video|members.only|age.restricted|sign in|login required|has been removed|video is private/i;
+function unavailableReasonOf(d: any, e: any): string | null {
+  const msg = (typeof d?.error === 'string' && d.error) || (() => { try { return JSON.parse(e?.body || '{}')?.error || ''; } catch { return ''; } })();
+  return msg && UNAVAILABLE_RE.test(String(msg)) ? String(msg) : null;
+}
 // 1回の走査で「combined（音声付きMP4）で実物確認OK」「形式は何でも実物確認OK」
 // 「未確認だが形式はある」の順に最良のものを探す。
-async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
+// excludeHosts はプレイヤーが実際に再生失敗した取得元（Choco-Tube-Plus の exclude 方式）。
+// 完全には外さず走査の最後尾に回す（学校で通るのがその1件だけ、という場合の保険）。
+async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()): Promise<InvVideoResult | null> {
   const endpoints = await getInvEndpoints();
-  const ordered = orderByScore(endpoints);
+  const byScore = orderByScore(endpoints);
+  const ordered = [...byScore.filter(ep => !excludeHosts.has(ep.baseUrl)), ...byScore.filter(ep => excludeHosts.has(ep.baseUrl))];
+  let unavailableCount = 0;
+  let unavailableReason = '';
   const probeOf = (d: any) => d.formatStreams?.[0]?.url
     || d.adaptiveFormats?.find((f: any) => f.url && String(f.type || '').startsWith('video/mp4'))?.url
     || d.adaptiveFormats?.[0]?.url;
@@ -295,8 +328,16 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
     const settled = await Promise.all(batch.map(async (ep) => {
       try {
         const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
-        return hasAny(d) ? { ep, d } : null;
-      } catch { return null; }
+        if (hasAny(d)) return { ep, d };
+        const reason = unavailableReasonOf(d, null);
+        if (reason) { unavailableCount++; unavailableReason = reason; }
+        return null;
+      } catch (e: any) {
+        noteFailure(ep.baseUrl, e);
+        const reason = unavailableReasonOf(null, e);
+        if (reason) { unavailableCount++; unavailableReason = reason; }
+        return null;
+      }
     }));
     const candidates = settled.filter(Boolean) as { ep: ApiEndpoint; d: any }[];
     for (const c of candidates) {
@@ -314,20 +355,36 @@ async function fetchInvVideo(id: string): Promise<InvVideoResult | null> {
   }
   // 最後に、優先順の先頭だけを単独で（並列の競合なしに）もう一度試す。
   // 並列バースト中はタイムアウトしていたインスタンスが、単独だと通ることがある。
-  for (const ep of ordered.slice(0, 2)) {
+  // 除外指定された取得元はここでは試さない（プレイヤーが実測で失敗した先のため）。
+  const soloTargets = ordered.filter(ep => !excludeHosts.has(ep.baseUrl)).slice(0, 2);
+  for (const ep of soloTargets) {
     try {
       const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
       if (hasAny(d) && await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
-    } catch { /* 次へ */ }
+      const reason = unavailableReasonOf(d, null);
+      if (reason) { unavailableCount++; unavailableReason = reason; }
+    } catch (e: any) {
+      noteFailure(ep.baseUrl, e);
+      const reason = unavailableReasonOf(null, e);
+      if (reason) { unavailableCount++; unavailableReason = reason; }
+    }
+  }
+  // 形式を返した取得元が1件もなく、3件以上が「再生不可」と申告したら動画側の状態として確定。
+  // 呼び出し側は再スイープや別経路を無駄に回さず、即フォールバックへ進める。
+  if (!firstUnverified && unavailableCount >= 3) {
+    const err: any = new Error(`video unavailable: ${unavailableReason}`);
+    err.unavailable = unavailableReason || 'Video unavailable';
+    throw err;
   }
   return firstUnverified;
 }
 
-export async function getVideo(id: string, fresh = false): Promise<PlayerData> {
-  const key = `video:${id}`;
+export async function getVideo(id: string, fresh = false, excludeHosts: string[] = []): Promise<PlayerData> {
+  const exSet = new Set(excludeHosts.map(s => s.replace(/\/$/, '')).filter(Boolean));
+  const key = exSet.size ? `video:${id}:x${[...exSet].sort().join(',')}` : `video:${id}`;
   // fresh=true: キャッシュを捨てて取り直す（プレイヤーが全形式失敗したときの再スイープ用。
   // 取得元インスタンスがタイミングで変わるため、別インスタンスで拾い直せることがある）
-  if (fresh) cache.delete(key);
+  if (fresh) { cache.delete(key); cache.delete(`video:${id}`); }
   const hit = getCached<PlayerData>(key); if (hit) return hit;
   const toPlayerData = (data: any, source: string): PlayerData => {
     const video: Video = normInvVideo(data) || { videoId: id, title: data.title || '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: data.author || '' };
@@ -339,10 +396,23 @@ export async function getVideo(id: string, fresh = false): Promise<PlayerData> {
   };
   // Invidious: 実物確認が通った結果は5分、未確認の結果は30秒だけキャッシュする
   // （未確認＝たまたま再生できないインスタンスを掴んだ可能性があるため、早めに再挑戦する）
-  let inv = await fetchInvVideo(id).catch(() => null);
   // 公開インスタンスは時間帯や接続元IPで成功率が揺れるため、全滅したら1回だけ再スイープする
-  // （2回目はスコア学習が効いて、速いインスタンスから試せる）
-  if (!inv) inv = await fetchInvVideo(id).catch(() => null);
+  // （2回目はスコア学習が効いて、速いインスタンスから試せる）。
+  // ただし複数インスタンスが「再生不可」と申告したら即確定し、再スイープも後段も回さない。
+  let inv: InvVideoResult | null = null;
+  let unavailable = '';
+  for (let attempt = 0; attempt < 2 && !inv && !unavailable; attempt++) {
+    try { inv = await fetchInvVideo(id, exSet); }
+    catch (e: any) { if (e?.unavailable) unavailable = String(e.unavailable); }
+  }
+  if (unavailable) {
+    const out: PlayerData = {
+      videoId: id,
+      video: { videoId: id, title: '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: '' },
+      formats: [], captions: [], source: 'invidious', unavailable,
+    };
+    setCached(key, out, 300_000); return out;
+  }
   if (inv) { const out = toPlayerData(inv.data, inv.source); setCached(key, out, inv.verified ? 300_000 : 30_000); return out; }
   // 第3段階: Piped（デフォルトでは動作するインスタンスなし。設定で追加された場合のみ）
   try {

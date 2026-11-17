@@ -2,17 +2,53 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { VideoFormat, CaptionTrack } from '@/lib/types';
 
+function heightOf(f: VideoFormat): number {
+  if (f.height) return f.height;
+  const m = String(f.qualityLabel || f.quality || '').match(/(\d+)p/);
+  return m ? Number(m[1]) : 0;
+}
 function sortFormats(formats: VideoFormat[]): VideoFormat[] {
   const rank = (f: VideoFormat) => f.type === 'mp4' && f.hasAudio ? 0 : f.type === 'mp4' ? 1 : f.type === 'dash' ? 2 : 3;
-  return [...formats].sort((a, b) => rank(a) - rank(b) || (b.height || 0) - (a.height || 0));
+  // 同格・同解像度では H.264（avc1）を優先する。学校の Chromebook 等でもデコードできる
+  // 可能性が高く、「形式はあるのに再生できない」失敗を減らせる（siatube の H.264 優先を参考）
+  const codecRank = (f: VideoFormat) => (String(f.mime || '').includes('avc1') ? 0 : 1);
+  return [...formats].sort((a, b) => rank(a) - rank(b) || heightOf(b) - heightOf(a) || codecRank(a) - codecRank(b));
 }
+// このブラウザで実際にデコードできる形式だけを候補に残す（canPlayType の実測）。
+// 全滅する場合は元のリストをそのまま使う（判定が厳しすぎた場合の保険）。
+function filterPlayable(formats: VideoFormat[]): VideoFormat[] {
+  if (typeof document === 'undefined') return formats;
+  try {
+    const probe = document.createElement('video');
+    const ok = formats.filter(f => {
+      if (f.type !== 'mp4' || !f.mime) return true;
+      try { return probe.canPlayType(f.mime) !== ''; } catch { return true; }
+    });
+    return ok.length ? ok : formats;
+  } catch { return formats; }
+}
+const PREF_HEIGHT_KEY = 'mugi-pref-height';
 
-export function Html5Player({ formats, captions, poster, title, onAllFailed }: { formats: VideoFormat[]; captions: CaptionTrack[]; poster?: string; title?: string; onAllFailed?: () => void }) {
+export function Html5Player({ formats, captions, poster, title, startAt, onAllFailed }: { formats: VideoFormat[]; captions: CaptionTrack[]; poster?: string; title?: string; startAt?: number; onAllFailed?: (time: number) => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const sorted = sortFormats(formats);
-  const [idx, setIdx] = useState(0);
+  const sorted = sortFormats(filterPlayable(formats));
+  // 前回選んだ画質（高さ）を覚えておき、次回はそれに一番近い形式から始める
+  const [idx, setIdx] = useState(() => {
+    try {
+      const pref = Number(localStorage.getItem(PREF_HEIGHT_KEY) || 0);
+      if (pref > 0) {
+        const exact = sorted.findIndex(f => heightOf(f) === pref);
+        if (exact >= 0) return exact;
+        let best = -1; let bestH = -1;
+        sorted.forEach((f, i) => { const h = heightOf(f); if (h > 0 && h <= pref && h > bestH) { bestH = h; best = i; } });
+        if (best >= 0) return best;
+      }
+    } catch { /* localStorage不可の環境では既定の0 */ }
+    return 0;
+  });
+  const startAppliedRef = useRef(false);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -88,7 +124,8 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
       return;
     }
     setError('再生中にエラーが発生しました。別の形式も試しましたが再生できませんでした。設定から公式埋め込みプレイヤーへの切り替えもできます。');
-    onAllFailed?.();
+    // 現在の再生位置を渡す（別ソースへ切り替えた先で続きから再開するため）
+    onAllFailed?.(videoRef.current?.currentTime || 0);
   };
   const toggle = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play().catch(() => handleError()); else v.pause(); };
   const seek = (s: number) => { const v = videoRef.current; if (v) v.currentTime = s; };
@@ -121,7 +158,15 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
         onPause={() => { setPlaying(false); syncAudio(); }}
         onTimeUpdate={e => { setTime(e.currentTarget.currentTime); syncAudio(); }}
         onSeeked={() => syncAudio(true)}
-        onLoadedMetadata={e => { setDuration(e.currentTarget.duration); setLoading(false); syncAudio(true); }}
+        onLoadedMetadata={e => {
+          setDuration(e.currentTarget.duration); setLoading(false);
+          // 別ソース切替で作り直されたプレイヤーでは、前プレイヤーの再生位置から再開する
+          if (startAt && startAt > 0 && !startAppliedRef.current) {
+            startAppliedRef.current = true;
+            try { e.currentTarget.currentTime = startAt; } catch { /* シーク不可なら先頭から */ }
+          }
+          syncAudio(true);
+        }}
         onWaiting={() => setLoading(true)} onPlaying={() => { setLoading(false); syncAudio(); }}
         onError={() => handleError()}
         onClick={toggle}
@@ -151,7 +196,7 @@ export function Html5Player({ formats, captions, poster, title, onAllFailed }: {
             {[0.5, 0.75, 1, 1.25, 1.5, 2].map(r => <option key={r} value={r} className="text-black">{r}倍</option>)}
           </select>
           {sorted.length > 1 && (
-            <select value={idx} onChange={e => { setTried([]); setIdx(Number(e.target.value)); }} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="画質">
+            <select value={idx} onChange={e => { const n = Number(e.target.value); setTried([]); setIdx(n); const h = heightOf(sorted[n]); if (h > 0) { try { localStorage.setItem(PREF_HEIGHT_KEY, String(h)); } catch { /* 保存できなくても再生は続ける */ } } }} className="rounded bg-white/10 px-1 py-1 text-xs text-white" aria-label="画質">
               {sorted.map((f, i) => <option key={i} value={i} className="text-black">{f.type.toUpperCase()} {f.qualityLabel || f.quality || ''}{f.audioUrl ? '（音声分離）' : ''}</option>)}
             </select>
           )}
