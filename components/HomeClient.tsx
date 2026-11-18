@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useStore } from '@/lib/store';
+import { useScrollRestore } from '@/lib/scroll';
 import { VideoCard } from '@/components/VideoCard';
 import type { Video } from '@/lib/types';
 
@@ -24,6 +25,8 @@ export function HomeClient() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const recent = store.settings.secretMode ? [] : store.history.slice(0, 8);
+  // 設定・ライブラリ等へ行って戻っても元のスクロール位置に復帰する
+  useScrollRestore('home', !loading);
 
   useEffect(() => {
     let cancelled = false;

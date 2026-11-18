@@ -16,7 +16,10 @@ export async function fetchJson(url: string, timeoutMs = 8000): Promise<any> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json', 'User-Agent': 'mugi-tube/0.1' }, cache: 'no-store' });
+    // Accept-Language: ja を付け、インスタンス側がロケールを選べる場面では日本語を要求する。
+    // 付けないとインスタンスの所在地ロケールでタイトルや相対時刻が返り、
+    // 「たまに英語（外国語）仕様になる」原因になる（実測: publishedText がアラビア語）。
+    const res = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json', 'Accept-Language': 'ja', 'User-Agent': 'mugi-tube/0.1' }, cache: 'no-store' });
     if (!res.ok) {
       // ステータスと Retry-After、エラーボディを例外に載せる（429クールダウン判定と
       // 「再生不可」の即確定分類に使う。siatube のリトライ規律を参考にした）
@@ -195,7 +198,7 @@ function normInvVideo(v: any): Video | null {
     videoId: v.videoId, title: v.title || '', description: v.description || '',
     thumbnail: invThumb(v), author: v.author || '', authorId: v.authorId,
     viewCount: v.viewCount, publishedAt: parsePublished(v.published),
-    publishedText: v.publishedText, duration: v.lengthSeconds, lengthSeconds: v.lengthSeconds,
+    duration: v.lengthSeconds, lengthSeconds: v.lengthSeconds,
   };
 }
 function normPipedVideo(v: any): Video | null {
@@ -205,7 +208,7 @@ function normPipedVideo(v: any): Video | null {
     thumbnail: proxyThumb(v.thumbnail || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`),
     author: v.uploaderName || '', authorId: v.uploaderUrl?.replace('/channel/', ''),
     viewCount: v.views, publishedAt: v.uploaded ? new Date(v.uploaded).toISOString() : undefined,
-    publishedText: v.uploadedDate, duration: v.duration, lengthSeconds: v.duration,
+    duration: v.duration, lengthSeconds: v.duration,
   };
 }
 export async function searchVideos(query: string, sort: string, page?: string | null): Promise<SearchResponse> {
@@ -217,7 +220,7 @@ export async function searchVideos(query: string, sort: string, page?: string | 
     const { data, source } = await tryEndpointsFast(invEndpoints, async (ep) => {
       const sortParam = sort === 'date' ? '&sort_by=date' : sort === 'views' ? '&sort_by=views' : '';
       const pageParam = page ? `&page=${encodeURIComponent(page)}` : '';
-      const d = await fetchJson(`${ep.baseUrl}/api/v1/search?q=${encodeURIComponent(query)}&type=video${sortParam}${pageParam}`, 5000);
+      const d = await fetchJson(`${ep.baseUrl}/api/v1/search?q=${encodeURIComponent(query)}&type=video&hl=ja${sortParam}${pageParam}`, 5000);
       if (!Array.isArray(d)) throw new Error('search response is not an array');
       return d;
     });
@@ -377,7 +380,7 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
     const batch = ordered.slice(offset, offset + 4);
     const settled = await Promise.all(batch.map(async (ep) => {
       try {
-        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
+        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
         if (hasAny(d)) return { ep, d };
         const reason = unavailableReasonOf(d, null);
         if (reason) { unavailableCount++; unavailableReason = reason; }
@@ -409,7 +412,7 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
   const soloTargets = ordered.filter(ep => !excludeHosts.has(ep.baseUrl)).slice(0, 2);
   for (const ep of soloTargets) {
     try {
-      const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true`, 12000);
+      const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
       if (hasAny(d) && await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
       const reason = unavailableReasonOf(d, null);
       if (reason) { unavailableCount++; unavailableReason = reason; }
@@ -494,7 +497,7 @@ export async function getChannel(id: string, sort: string): Promise<ChannelInfo>
   const hit = getCached<ChannelInfo>(key); if (hit) return hit;
   const invEndpoints = await getInvEndpoints();
   try {
-    const { data, source } = await tryEndpoints(invEndpoints, async (ep) => fetchJson(`${ep.baseUrl}/api/v1/channels/${id}`));
+    const { data, source } = await tryEndpoints(invEndpoints, async (ep) => fetchJson(`${ep.baseUrl}/api/v1/channels/${id}?hl=ja`));
     const videos = (data.latestVideos || []).map(normInvVideo).filter(Boolean) as Video[];
     const sorted = sort === 'views' ? [...videos].sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0)) : sort === 'oldest' ? [...videos].reverse() : videos;
     const out: ChannelInfo = { authorId: id, author: data.author || '', authorThumbnail: proxyThumb(data.authorThumbnails?.[data.authorThumbnails.length - 1]?.url), description: data.description || '', subscriberCount: data.subCount, totalViews: data.totalViews, videos: sorted, source };

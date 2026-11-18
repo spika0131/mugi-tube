@@ -29,6 +29,9 @@ export interface Video {
   authorThumbnail?: string;
   viewCount?: number;
   publishedAt?: string;
+  // publishedText（インスタンス生成の相対時刻文字列）はロケールがバラバラで
+  // アラビア語等になるため使わない。サーバーは埋めず、表示は publishedAt から
+  // クライアント側で日本語に整形する（timeAgo）。
   publishedText?: string;
   duration?: number;
   lengthSeconds?: number;
@@ -123,21 +126,29 @@ export function defaultEndpoints(): ApiEndpoint[] {
 }
 export function formatViews(n?: number) {
   if (n == null) return '';
-  if (n >= 1e8) return `${(n / 1e8).toFixed(1)}億回`;
-  if (n >= 1e4) return `${(n / 1e4).toFixed(1)}万回`;
-  return `${n.toLocaleString()}回`;
+  // 1.0万回 のような末尾 .0 は落として日本語として自然な表記にする
+  const trimZero = (s: string) => s.replace(/\.0$/, '');
+  if (n >= 1e8) return `${trimZero((n / 1e8).toFixed(1))}億回`;
+  if (n >= 1e4) return `${trimZero((n / 1e4).toFixed(1))}万回`;
+  return `${n.toLocaleString('ja-JP')}回`;
 }
 export function formatDuration(sec?: number) {
   if (sec == null) return '';
   const h = Math.floor(sec / 3600); const m = Math.floor((sec % 3600) / 60); const s = sec % 60;
   return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
 }
+// 相対時刻はインスタンス生成の文字列（publishedText）を使わず、
+// publishedAt（ISO）から日本語で整形する。○分前・○時間前まで細かく出す。
 export function timeAgo(iso?: string) {
   if (!iso) return '';
-  const d = new Date(iso).getTime(); if (isNaN(d)) return iso;
-  const diff = Date.now() - d; const day = 86400000;
-  if (diff < day) return '今日';
-  if (diff < 30 * day) return `${Math.floor(diff / day)}日前`;
+  const d = new Date(iso).getTime(); if (isNaN(d)) return '';
+  const diff = Date.now() - d;
+  if (diff < 60_000) return 'たった今';
+  const min = 60_000, hour = 60 * min, day = 24 * hour;
+  if (diff < hour) return `${Math.floor(diff / min)}分前`;
+  if (diff < day) return `${Math.floor(diff / hour)}時間前`;
+  if (diff < 7 * day) return `${Math.floor(diff / day)}日前`;
+  if (diff < 30 * day) return `${Math.floor(diff / (7 * day))}週間前`;
   if (diff < 365 * day) return `${Math.floor(diff / (30 * day))}か月前`;
   return `${Math.floor(diff / (365 * day))}年前`;
 }

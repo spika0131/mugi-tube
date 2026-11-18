@@ -4,8 +4,19 @@ import Link from 'next/link';
 import { Html5Player } from './Html5Player';
 import { VideoCard } from './VideoCard';
 import { useStore, useFavorites, useMini, recordHistory } from '@/lib/store';
+import { loadSessionCache, saveSessionCache } from '@/lib/scroll';
 import { formatViews, timeAgo } from '@/lib/types';
 import type { PlayerData } from '@/lib/types';
+
+// 視聴ページの状態退避: 他画面へ行って戻っても再取得せず即表示できるよう、
+// PlayerData を sessionStorage に短時間（サーバー側キャッシュと同程度）退避する。
+// 再生位置も退避し、戻ったときに途中から再開できるようにする。
+const WATCH_CACHE_TTL = 5 * 60 * 1000;
+const watchCacheKey = (id: string) => `mugi-watch-v1:${id}`;
+const posKey = (id: string) => `mugi-pos:${id}`;
+function loadPos(id: string): number {
+  try { const v = Number(sessionStorage.getItem(posKey(id))); return Number.isFinite(v) && v > 0 ? v : 0; } catch { return 0; }
+}
 
 export function WatchClient({ videoId }: { videoId: string }) {
   const [data, setData] = useState<PlayerData | null>(null);
@@ -24,7 +35,7 @@ export function WatchClient({ videoId }: { videoId: string }) {
   const dataRef = useRef<PlayerData | null>(null);
   useEffect(() => { dataRef.current = data; }, [data]);
   useEffect(() => {
-    switchCountRef.current = 0; setSwitchCount(0); setUseFresh(false); setExcludeHosts([]); setResumeAt(0);
+    switchCountRef.current = 0; setSwitchCount(0); setUseFresh(false); setExcludeHosts([]); setResumeAt(loadPos(videoId));
   }, [videoId]);
   const handleRequestAlt = (time: number) => {
     if (switchCountRef.current >= 2) return false;
@@ -42,6 +53,12 @@ export function WatchClient({ videoId }: { videoId: string }) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true); setError(''); setData(null); setAttempt(0);
+    // 通常の初回表示では、退避済みの PlayerData があれば再取得せず即表示する
+    // （別ソース再取得・fresh 再スイープ時はキャッシュを使わない）
+    if (reloadKey === 0 && !useFresh && excludeHosts.length === 0) {
+      const cached = loadSessionCache<PlayerData>(watchCacheKey(videoId), WATCH_CACHE_TTL);
+      if (cached && cached.formats) { setData(cached); setLoading(false); return () => { cancelled = true; }; }
+    }
     // 取得元インスタンスの成否はタイミングで揺れるため、失敗したら少し待って最大3回まで自動リトライする。
     // 待機は回数で延ばし、少しランダムにずらす（同時リトライの集中とレート制限の悪化を防ぐ。
     // siatube のリトライ規律を参考）。自前APIが 429 と Retry-After を返したらそれを尊重する。
@@ -63,7 +80,11 @@ export function WatchClient({ videoId }: { videoId: string }) {
           }
           const j = await r.json();
           if (cancelled) return;
-          if (!j.error && j.formats) { setData(j); setLoading(false); return; }
+          if (!j.error && j.formats) {
+            // 素の取得結果だけを退避する（除外指定つきの結果を次回の素の表示で使うと失敗元を掴み直すため）
+            if (!useFresh && excludeHosts.length === 0) saveSessionCache(watchCacheKey(videoId), j);
+            setData(j); setLoading(false); return;
+          }
           if (i === 2) { setError(j.error || '動画情報を取得できませんでした'); setLoading(false); return; }
         } catch (e: any) {
           if (cancelled) return;
@@ -186,6 +207,17 @@ function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeA
     setAltMsg('切り替えられる別のソースがもうありません。Education再生への切替をお試しください。');
   };
   useEffect(() => { recordHistory(video); }, [video.videoId]);
+  // 再生位置を定期的に退避する（他画面へ行って戻っても途中から再開できるように）
+  useEffect(() => {
+    const save = () => {
+      const t = timeRef.current;
+      if (t > 0) { try { sessionStorage.setItem(posKey(video.videoId), String(Math.floor(t))); } catch { /* ignore */ } }
+    };
+    const iv = setInterval(save, 5000);
+    return () => { save(); clearInterval(iv); };
+  }, [video.videoId]);
+  // 退避した再生位置が末尾付近なら先頭からにする（見終わった動画を途中から始めない）
+  const startPos = resumeAt && data.duration && resumeAt >= Math.max(0, data.duration - 10) ? 0 : resumeAt;
   const fav = isFav(video.videoId);
   const addToPlaylist = () => {
     const name = playlistName.trim() || 'お気に入りリスト';
@@ -212,7 +244,7 @@ function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeA
         ) : mode === 'embed' ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} audios={data.audios} source={source} timeRef={timeRef} poster={video.thumbnail} title={video.title} startAt={resumeAt} onAllFailed={(t) => { if (onRequestAlt && onRequestAlt(t)) return; setAutoSwitched(true); setMode('education'); }} />
+          <Html5Player formats={formats} captions={captions} audios={data.audios} source={source} timeRef={timeRef} poster={video.thumbnail} title={video.title} startAt={startPos} onAllFailed={(t) => { if (onRequestAlt && onRequestAlt(t)) return; setAutoSwitched(true); setMode('education'); }} />
         ) : (
           <EducationPlayer videoId={video.videoId} title={video.title} />
         )}

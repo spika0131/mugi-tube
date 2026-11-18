@@ -1,35 +1,66 @@
 'use client';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { VideoCard } from '@/components/VideoCard';
 import { useStore } from '@/lib/store';
+import { loadSessionCache, saveSessionCache, useScrollRestore } from '@/lib/scroll';
 import type { Video } from '@/lib/types';
 
-export function SearchClient({ q, sort: initialSort }: { q: string; sort: string }) {
+// 検索状態（クエリ・ソート・読み込み済みページ・結果）を sessionStorage に退避し、
+// 設定/ライブラリ/視聴ページへ行って戻っても再検索なしで復帰できるようにする。
+// ソートは URL クエリが真実（ブラウザの戻る/進むでも維持される）。
+const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+const cacheKey = (q: string, sort: string) => `mugi-search-v1:${q}:${sort}`;
+interface SearchCache { videos: Video[]; source: string; page: number; }
+
+export function SearchClient({ q, sort }: { q: string; sort: string }) {
   const [videos, setVideos] = useState<Video[]>([]);
   const [source, setSource] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [sort, setSort] = useState(initialSort);
   const [page, setPage] = useState(1);
   const { store } = useStore();
+  const router = useRouter();
+  const restoredRef = useRef('');
 
-  const runSearch = useCallback(async (s: string, p: number, append: boolean) => {
+  const runSearch = useCallback(async (s: string, p: number, append: boolean, base: Video[] = []) => {
     if (!q) return;
     setLoading(true);
     try {
       const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&sort=${s}&page=${p}`);
       const j = await r.json();
       if (j.error) { setError(j.error); return; }
-      setVideos(v => append ? [...v, ...(j.results || [])] : (j.results || []));
+      const merged = append ? [...base, ...(j.results || [])] : (j.results || []);
+      setVideos(merged);
       setSource(j.source || '');
+      saveSessionCache(cacheKey(q, s), { videos: merged, source: j.source || '', page: p } satisfies SearchCache);
     } catch (e: any) { setError(e?.message || '検索に失敗しました'); }
     finally { setLoading(false); }
   }, [q]);
 
-  useEffect(() => { setPage(1); setVideos([]); runSearch(sort, 1, false); }, [q, sort, runSearch]);
+  useEffect(() => {
+    // 同じ q+sort での再マウント（他画面から戻ってきた）なら、キャッシュから即復帰して再検索しない
+    const ck = cacheKey(q, sort);
+    if (restoredRef.current !== ck) {
+      restoredRef.current = ck;
+      const cached = loadSessionCache<SearchCache>(ck, SEARCH_CACHE_TTL);
+      if (cached && cached.videos.length) {
+        setVideos(cached.videos); setSource(cached.source); setPage(cached.page); setError('');
+        return;
+      }
+    }
+    setPage(1); setVideos([]);
+    runSearch(sort, 1, false);
+  }, [q, sort, runSearch]);
 
-  const loadMore = () => { const p = page + 1; setPage(p); runSearch(sort, p, true); };
-  const changeSort = (s: string) => { if (s === sort) return; setSort(s); setPage(1); };
+  useScrollRestore(`search:${q}:${sort}`, !loading && videos.length > 0);
+
+  const loadMore = () => { const p = page + 1; setPage(p); runSearch(sort, p, true, videos); };
+  const changeSort = (s: string) => {
+    if (s === sort) return;
+    // ソートを URL に残すことで、戻る/進むや再マウントでも並び順が維持される
+    router.replace(`/search?q=${encodeURIComponent(q)}&sort=${s}`, { scroll: false });
+  };
 
   return (
     <div>
