@@ -19,14 +19,17 @@ export function WatchClient({ videoId }: { videoId: string }) {
   const [excludeHosts, setExcludeHosts] = useState<string[]>([]);
   const [resumeAt, setResumeAt] = useState(0);
   const switchCountRef = useRef(0);
+  // 別ソース切替の段階表示用（「別ソースで再取得中…（n/2回目）」）
+  const [switchCount, setSwitchCount] = useState(0);
   const dataRef = useRef<PlayerData | null>(null);
   useEffect(() => { dataRef.current = data; }, [data]);
   useEffect(() => {
-    switchCountRef.current = 0; setUseFresh(false); setExcludeHosts([]); setResumeAt(0);
+    switchCountRef.current = 0; setSwitchCount(0); setUseFresh(false); setExcludeHosts([]); setResumeAt(0);
   }, [videoId]);
   const handleRequestAlt = (time: number) => {
     if (switchCountRef.current >= 2) return false;
     switchCountRef.current += 1;
+    setSwitchCount(switchCountRef.current);
     const src = dataRef.current?.source || '';
     const m = src.match(/^(?:invidious|piped):(https?:\/\/.+)$/);
     if (m) setExcludeHosts(prev => (prev.includes(m[1]) ? prev : [...prev, m[1]]));
@@ -77,7 +80,9 @@ export function WatchClient({ videoId }: { videoId: string }) {
       <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
         <div>
           <div className="relative aspect-video animate-pulse rounded-2xl bg-neutral-800">
-            {attempt > 1 && <div className="absolute inset-0 grid place-items-center text-sm text-neutral-300">取得を再試行しています…（{attempt}/3回目）</div>}
+            {switchCount > 0
+              ? <div className="absolute inset-0 grid place-items-center text-sm text-neutral-300">別ソースで再取得中…（{switchCount}/2回目）</div>
+              : attempt > 1 && <div className="absolute inset-0 grid place-items-center text-sm text-neutral-300">取得を再試行しています…（{attempt}/3回目）</div>}
           </div>
           <div className="mt-4 h-6 w-3/4 animate-pulse rounded bg-neutral-800" />
           <div className="mt-2 h-4 w-1/2 animate-pulse rounded bg-neutral-800" />
@@ -108,21 +113,42 @@ export function WatchClient({ videoId }: { videoId: string }) {
 type PlayMode = 'html5' | 'education' | 'embed';
 
 function EducationPlayer({ videoId, title }: { videoId: string; title: string }) {
-  const [src, setSrc] = useState('');
+  // Education パラメータは複数保持し、1つが塞がれても次を順に試せる
+  // （サーバーが配布元群から自動取得した候補を /api/edu が alternates 付きで返す）
+  const [paramsList, setParamsList] = useState<{ params: string; source: string }[]>([]);
+  const [pIdx, setPIdx] = useState(0);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
     let cancelled = false;
+    setParamsList([]); setPIdx(0); setFailed(false);
     fetch('/api/edu').then(r => r.json()).then(j => {
       if (cancelled) return;
       if (!j.params) { setFailed(true); return; }
-      const p = String(j.params);
-      setSrc(`https://www.youtubeeducation.com/embed/${videoId}${p.startsWith('?') ? p : `?${p}`}&playlist=${videoId}`);
+      const list = [
+        { params: String(j.params), source: String(j.source || '') },
+        ...((Array.isArray(j.alternates) ? j.alternates : []) as any[]).map(a => ({ params: String(a?.params || ''), source: String(a?.source || '') })),
+      ].filter(p => p.params);
+      setParamsList(list.length ? list : [{ params: String(j.params), source: '' }]);
     }).catch(() => { if (!cancelled) setFailed(true); });
     return () => { cancelled = true; };
   }, [videoId]);
   if (failed) return <div className="grid aspect-video w-full place-items-center rounded-2xl bg-black p-6 text-center text-sm text-neutral-300">Education再生の準備に失敗しました。下の「公式埋め込み」に切り替えてみてください。</div>;
-  if (!src) return <div className="grid aspect-video w-full place-items-center rounded-2xl bg-black text-sm text-neutral-400">Education再生を準備中…</div>;
-  return <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={src} title={title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>;
+  const cur = paramsList[pIdx];
+  if (!cur) return <div className="grid aspect-video w-full place-items-center rounded-2xl bg-black text-sm text-neutral-400">Education再生を準備中…</div>;
+  const p = cur.params;
+  const src = `https://www.youtubeeducation.com/embed/${videoId}${p.startsWith('?') ? p : `?${p}`}&playlist=${videoId}`;
+  return (
+    <div>
+      <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe key={pIdx} src={src} title={title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
+      {paramsList.length > 1 && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-neutral-400">
+          <span>Educationパラメータ: {cur.source || '既定'}（{pIdx + 1}/{paramsList.length}）</span>
+          <button onClick={() => setPIdx(i => (i + 1) % paramsList.length)} className="rounded-full bg-card px-3 py-1 text-neutral-200 hover:bg-neutral-700">別のパラメータで試す</button>
+          <span>再生できないときはパラメータを切り替えると開けることがあります。</span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeAt?: number; onRequestAlt?: (time: number) => boolean }) {
@@ -152,6 +178,13 @@ function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeA
   // youtube-nocookie.com が規制される環境では通らないため、その手前で Education を挟む）。
   const [mode, setMode] = useState<PlayMode>(store.settings.player);
   const [autoSwitched, setAutoSwitched] = useState(false);
+  // 手動の「別ソースで再取得」用に、プレイヤーの現在位置を ref で受け取る
+  const timeRef = useRef(0);
+  const [altMsg, setAltMsg] = useState('');
+  const handleManualAlt = () => {
+    if (onRequestAlt && onRequestAlt(timeRef.current)) return;
+    setAltMsg('切り替えられる別のソースがもうありません。Education再生への切替をお試しください。');
+  };
   useEffect(() => { recordHistory(video); }, [video.videoId]);
   const fav = isFav(video.videoId);
   const addToPlaylist = () => {
@@ -171,13 +204,15 @@ function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeA
           {([['html5', '独自プレイヤー'], ['education', 'Education'], ['embed', '公式埋め込み']] as [PlayMode, string][]).map(([m, label]) => (
             <button key={m} onClick={() => { setMode(m); setAutoSwitched(false); }} className={`rounded-full px-3 py-1.5 ${mode === m ? 'bg-wakame font-bold text-black' : 'bg-card text-neutral-300'}`}>{label}</button>
           ))}
+          <button onClick={handleManualAlt} className="rounded-full bg-card px-3 py-1.5 text-neutral-300">別ソースで再取得</button>
+          {altMsg && <span className="text-amber-300">{altMsg}</span>}
         </div>
         {mode === 'education' ? (
           <EducationPlayer videoId={video.videoId} title={video.title} />
         ) : mode === 'embed' ? (
           <div className="aspect-video w-full overflow-hidden rounded-2xl bg-black"><iframe src={`https://www.youtube-nocookie.com/embed/${video.videoId}`} title={video.title} className="h-full w-full" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowFullScreen /></div>
         ) : formats.length ? (
-          <Html5Player formats={formats} captions={captions} poster={video.thumbnail} title={video.title} startAt={resumeAt} onAllFailed={(t) => { if (onRequestAlt && onRequestAlt(t)) return; setAutoSwitched(true); setMode('education'); }} />
+          <Html5Player formats={formats} captions={captions} audios={data.audios} source={source} timeRef={timeRef} poster={video.thumbnail} title={video.title} startAt={resumeAt} onAllFailed={(t) => { if (onRequestAlt && onRequestAlt(t)) return; setAutoSwitched(true); setMode('education'); }} />
         ) : (
           <EducationPlayer videoId={video.videoId} title={video.title} />
         )}

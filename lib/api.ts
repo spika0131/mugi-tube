@@ -1,4 +1,4 @@
-import { ApiEndpoint, ChannelInfo, PlayerData, SearchResponse, Video, VideoFormat, CaptionTrack, DEFAULT_INVIDIOUS, defaultEndpoints } from './types';
+import { ApiEndpoint, AudioOption, ChannelInfo, PlayerData, SearchResponse, Video, VideoFormat, CaptionTrack, DEFAULT_INVIDIOUS, defaultEndpoints } from './types';
 
 // 注意: Next.js のサーバーではこのモジュールが複数コピー読み込まれることがあり、
 // モジュールスコープの Map がリクエスト間で共有されない（実測で確認）。
@@ -46,12 +46,43 @@ const scores: Map<string, { ms: number; at: number; failed: boolean }> = __g.__m
 // 429（レート制限）を受けたインスタンスのクールダウン期限。相手が指定した
 // Retry-After を尊重し、その間は後回しにして制限を悪化させない（siatube の規律を参考）
 const cooldowns: Map<string, number> = __g.__mugiCooldowns || (__g.__mugiCooldowns = new Map());
+// ペナルティ管理（わかめtube Plus の方式、安定化パック第2弾）:
+// 時間窓（10分）内にタイムアウトが閾値（5回）に達したインスタンスは30分間
+// 自動ブロックし、成功するたびにペナルティを1減らす。第1弾の429クールダウン
+// （単発・短期で後回し）とは役割が違い、こちらは「慢性的に死んでいる取得元」を
+// 中期間外して無駄な試行と待ち時間を減らすためのもの。
+const penalties: Map<string, { count: number; windowStart: number; blockedUntil: number }> = __g.__mugiPenalties || (__g.__mugiPenalties = new Map());
+const PENALTY_WINDOW_MS = 600_000;
+const PENALTY_THRESHOLD = 5;
+const PENALTY_BLOCK_MS = 1_800_000;
+function isTimeoutError(e: any): boolean {
+  const msg = String(e?.message || '');
+  return e?.name === 'AbortError' || /timeout|aborted/i.test(msg);
+}
+function noteTimeout(baseUrl: string) {
+  const now = Date.now();
+  const p = penalties.get(baseUrl) || { count: 0, windowStart: now, blockedUntil: 0 };
+  if (now - p.windowStart > PENALTY_WINDOW_MS) { p.count = 0; p.windowStart = now; }
+  p.count += 1;
+  if (p.count >= PENALTY_THRESHOLD) { p.blockedUntil = now + PENALTY_BLOCK_MS; p.count = 0; p.windowStart = now; }
+  penalties.set(baseUrl, p);
+}
+// 成功したらペナルティを1減らす（回復を早め、一時的な不調で外し続けない）
+function noteInstanceSuccess(baseUrl: string) {
+  const p = penalties.get(baseUrl);
+  if (p && p.count > 0) { p.count -= 1; penalties.set(baseUrl, p); }
+}
+function isPenalized(baseUrl: string): boolean {
+  const p = penalties.get(baseUrl);
+  return !!p && p.blockedUntil > Date.now();
+}
 function noteFailure(baseUrl: string, e: any) {
   scores.set(baseUrl, { ms: 9999, at: Date.now(), failed: true });
   if (e?.status === 429) {
     const sec = Math.min(Math.max(Number(e?.retryAfterSec) || 30, 5), 180);
     cooldowns.set(baseUrl, Date.now() + sec * 1000);
   }
+  if (isTimeoutError(e)) noteTimeout(baseUrl);
 }
 function orderByScore(eps: ApiEndpoint[]): ApiEndpoint[] {
   const now = Date.now();
@@ -59,8 +90,8 @@ function orderByScore(eps: ApiEndpoint[]): ApiEndpoint[] {
     const sa = scores.get(a.baseUrl), sb = scores.get(b.baseUrl);
     // 注意: !! で boolean に揃えること。false と undefined を混ぜると比較関数が
     // 矛盾し（両方向で -1 を返す）、ソート結果が不定になって速いインスタンスが後ろへ行く。
-    const fa = !!((sa?.failed && now - sa.at < 60_000) || (cooldowns.get(a.baseUrl) || 0) > now);
-    const fb = !!((sb?.failed && now - sb.at < 60_000) || (cooldowns.get(b.baseUrl) || 0) > now);
+    const fa = !!((sa?.failed && now - sa.at < 60_000) || (cooldowns.get(a.baseUrl) || 0) > now || isPenalized(a.baseUrl));
+    const fb = !!((sb?.failed && now - sb.at < 60_000) || (cooldowns.get(b.baseUrl) || 0) > now || isPenalized(b.baseUrl));
     if (fa !== fb) return fa ? 1 : -1;
     return (sa?.ms ?? 1500) - (sb?.ms ?? 1500);
   });
@@ -74,6 +105,7 @@ async function tryEndpointsFast<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoin
     try {
       const data = await fn(ep);
       scores.set(ep.baseUrl, { ms: Date.now() - t0, at: Date.now(), failed: false });
+      noteInstanceSuccess(ep.baseUrl);
       return data;
     } catch (e) {
       noteFailure(ep.baseUrl, e);
@@ -110,6 +142,15 @@ export function proxyThumb(url?: string): string {
 // 取得元: https://raw.githubusercontent.com/toka-kun/Education/refs/heads/main/apis/Invidious/yes.json
 // 1時間キャッシュ。失敗したら前回値か DEFAULT_INVIDIOUS を使う。環境変数 INVIDIOUS_ENDPOINTS があればそちらを優先（固定）。
 const INV_LIST_URL = 'https://raw.githubusercontent.com/toka-kun/Education/refs/heads/main/apis/Invidious/yes.json';
+// 自リポジトリのリスト（安定化パック第2弾で外部JSON化）:
+// config/invidious-instances.json を編集して push するだけで、再デプロイなしに
+// インスタンスを差し替えられる。サーバーは raw 経由で定期取得（1時間キャッシュ）する。
+const OWN_INV_LIST_URL = 'https://raw.githubusercontent.com/spika0131/mugi-tube/main/config/invidious-instances.json';
+async function fetchInvList(url: string): Promise<string[]> {
+  const remote: any = await fetchJson(url, 5000);
+  const arr = Array.isArray(remote) ? remote : remote?.instances;
+  return (Array.isArray(arr) ? arr : []).map((s: any) => String(s || '').replace(/\/$/, '')).filter((s: string) => s.startsWith('https://'));
+}
 let invListCache: { at: number; urls: string[] } | null = __g.__mugiInvList || null;
 export async function getInvEndpoints(): Promise<ApiEndpoint[]> {
   const env = (process.env.INVIDIOUS_ENDPOINTS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -119,14 +160,17 @@ export async function getInvEndpoints(): Promise<ApiEndpoint[]> {
   } else if (invListCache && Date.now() - invListCache.at < 3_600_000) {
     urls = invListCache.urls;
   } else {
-    try {
-      const remote: any = await fetchJson(INV_LIST_URL, 5000);
-      const remoteUrls = (Array.isArray(remote) ? remote : []).map((s: any) => String(s || '').replace(/\/$/, '')).filter((s: string) => s.startsWith('https://'));
-      if (!remoteUrls.length) throw new Error('empty invidious list');
-      // 実測で中継再生できたものを先頭に固定し、残りは配布リスト順。重複は除く
-      urls = [...new Set([...DEFAULT_INVIDIOUS, ...remoteUrls])];
+    // 自前リストと toka-kun 配布リストを並列取得し、取れたものをマージする。
+    // どちらか一方でも取れれば更新し、両方失敗したら前回値か内蔵リストにフォールバック。
+    const [own, toka] = await Promise.all([
+      fetchInvList(OWN_INV_LIST_URL).catch(() => [] as string[]),
+      fetchInvList(INV_LIST_URL).catch(() => [] as string[]),
+    ]);
+    if (own.length || toka.length) {
+      // 実測で中継再生できたものを先頭に固定し、次に自前リスト、残りは配布リスト順。重複は除く
+      urls = [...new Set([...DEFAULT_INVIDIOUS, ...own, ...toka])];
       invListCache = { at: Date.now(), urls }; __g.__mugiInvList = invListCache;
-    } catch {
+    } else {
       urls = invListCache?.urls || DEFAULT_INVIDIOUS;
     }
   }
@@ -219,21 +263,26 @@ export async function getSuggestions(query: string): Promise<string[]> {
     return Array.isArray(data?.suggestions) ? data.suggestions : [];
   } catch { return []; }
 }
-function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[] } {
+function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[]; audios: AudioOption[] } {
   const formats: VideoFormat[] = [];
   // formatStreams are MP4 files with audio — preferred, single URL.
   // ?local=true で取得しているので URL はインスタンス自身の /videoplayback 中継になり、
   // ブラウザが googlevideo.com に触れずに再生できる（2026-11-10 に i234.cyou で実測）。
+  // 統合形式（音声付き単一ファイル）は分離再生より優先する（安定化パック第2弾）:
+  // 同期ズレが原理的に起きず再生開始も速いため、combined フラグを付け、
+  // プレイヤー側の並び替えでも最優先に扱う。無い場合のみ分離同期再生になる。
   for (const f of v.formatStreams || []) {
-    if (f.url) formats.push({ url: f.url, type: 'mp4', mime: f.type, quality: f.quality, qualityLabel: f.qualityLabel, fps: f.fps, hasAudio: true });
+    if (f.url) formats.push({ url: f.url, type: 'mp4', mime: f.type, quality: f.quality, qualityLabel: f.qualityLabel, fps: f.fps, hasAudio: true, combined: true, bitrate: Number(f.bitrate) || undefined });
   }
   // adaptiveFormats: 映像と音声が別URL。高画質はこちらにしかないので、
-  // 最も良い音声（audio/mp4 の最大bitrate）を audioUrl として付け、プレイヤー側で同期再生する
+  // 音声候補をビットレート順にすべて保持し（音質選択用）、最も良い音声を
+  // 既定の audioUrl として付け、プレイヤー側で同期再生する
   // （わかめtube Plus の隠しaudio要素方式）。local=true なので映像・音声ともインスタンス中継。
   const adaptives: any[] = Array.isArray(v.adaptiveFormats) ? v.adaptiveFormats : [];
-  const audios = adaptives.filter((f: any) => f.url && String(f.type || '').startsWith('audio/mp4'))
-    .sort((a: any, b: any) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
-  const bestAudio = audios[0]?.url as string | undefined;
+  const audioOptions: AudioOption[] = adaptives.filter((f: any) => f.url && String(f.type || '').startsWith('audio/mp4'))
+    .sort((a: any, b: any) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))
+    .map((f: any) => ({ url: f.url as string, bitrate: Number(f.bitrate) || 0, label: `${Math.round((Number(f.bitrate) || 0) / 1000)}kbps` }));
+  const bestAudio = audioOptions[0]?.url;
   const heightOf = (f: any) => { const m = String(f.resolution || '').match(/(\d+)p/); return m ? Number(m[1]) : 0; };
   const videos = adaptives.filter((f: any) => f.url && String(f.type || '').startsWith('video/mp4') && String(f.type || '').includes('avc1'))
     .sort((a: any, b: any) => heightOf(b) - heightOf(a));
@@ -250,7 +299,7 @@ function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[] 
     formats.push({ url: u, type: 'hls', quality: 'HLS', hasAudio: true });
   }
   const captions: CaptionTrack[] = (v.captions || []).filter((c: any) => c.url).map((c: any) => ({ label: c.label, language: c.languageCode, url: c.url }));
-  return { formats, captions };
+  return { formats, captions, audios: audioOptions };
 }
 function pipedFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[] } {
   const formats: VideoFormat[] = [];
@@ -319,6 +368,7 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
     if (!probe) return false;
     const ok = await verifyStream(probe, 6000);
     scores.set(ep.baseUrl, ok ? { ms: 500, at: Date.now(), failed: false } : { ms: 9999, at: Date.now(), failed: true });
+    if (ok) noteInstanceSuccess(ep.baseUrl);
     return ok;
   };
   // 並列バッチ（4件ずつ・最大12件）。並列度を抑えるのは、同時接続が多いと
@@ -390,9 +440,9 @@ export async function getVideo(id: string, fresh = false, excludeHosts: string[]
     const video: Video = normInvVideo(data) || { videoId: id, title: data.title || '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: data.author || '' };
     video.description = data.description || ''; video.authorId = data.authorId; video.viewCount = data.viewCount;
     video.publishedAt = parsePublished(data.published);
-    const { formats, captions } = invFormats(data);
+    const { formats, captions, audios } = invFormats(data);
     const related = (data.recommendedVideos || []).map(normInvVideo).filter(Boolean) as Video[];
-    return { videoId: id, video, formats, captions, duration: data.lengthSeconds, source, related };
+    return { videoId: id, video, formats, captions, audios, duration: data.lengthSeconds, source, related };
   };
   // Invidious: 実物確認が通った結果は5分、未確認の結果は30秒だけキャッシュする
   // （未確認＝たまたま再生できないインスタンスを掴んだ可能性があるため、早めに再挑戦する）

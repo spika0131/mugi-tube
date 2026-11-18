@@ -10,7 +10,14 @@ export interface VideoFormat {
   // 映像と音声が別URLの形式（Invidious adaptiveFormats）用。プレイヤーが隠しaudio要素を同期再生する
   audioUrl?: string;
   height?: number;
+  // formatStreams 由来の「音声付き単一ファイル」（itag 18等）。true の形式は分離再生より
+  // 優先される（同期ズレが原理的に起きず、再生開始も速いため）
+  combined?: boolean;
+  // 音声形式のビットレート（bps）。音質選択の表示・並び替えに使う
+  bitrate?: number;
 }
+// 分離再生時に選べる音声（音質）候補。bitrate の高い順
+export interface AudioOption { url: string; bitrate: number; label: string; }
 export interface CaptionTrack { label: string; language: string; url: string; }
 export interface Video {
   videoId: string;
@@ -34,6 +41,8 @@ export interface PlayerData {
   video: Video;
   formats: VideoFormat[];
   captions: CaptionTrack[];
+  // 分離再生（adaptiveFormats）で選択可能な音声候補。未指定なら各形式の audioUrl が使われる
+  audios?: AudioOption[];
   duration?: number;
   source: string;
   related?: Video[];
