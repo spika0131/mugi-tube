@@ -384,26 +384,48 @@ export function companionErrorOf(d: any, e: any): string | null {
   const raw = typeof e?.body === 'string' ? e.body : '';
   return raw && COMPANION_RE.test(raw) ? raw : null;
 }
-// 「再生不可」の即確定分類（siatube の VIDEO_STREAM_ERROR_CODES を参考）:
-// 1インスタンスの申告だけでは確定しない（地域制限など取得元で結果が違うため）。
-// 複数（3件以上）が独立に同じ申告をしたら、動画側の状態として確定させる。
+// 「再生不可」の票の分類。票は2段に分ける:
+// - 強いシグナル: 非公開・年齢制限・メンバー限定・削除など、動画そのものの状態を
+//   表す申告。どのインスタンスから見ても変わらない事実なので信頼できる。
+// - 汎用シグナル: "Video unavailable" / "not available" のような曖昧な申告。
+//   companion 非搭載やクライアント陳腐化など「そのインスタンスでは出せない」
+//   場合にも返されるため、それだけでは動画の有罪票にしない。形式を返せた
+//   実績のあるインスタンス（provenHosts）からの票だけを数える。
 // companion エラーはここでは絶対に数えない（上記の通り意味が正反対のため）。
-const UNAVAILABLE_RE = /unavailable|not available|private video|members.only|age.restricted|sign in|login required|has been removed|video is private/i;
-export function unavailableReasonOf(d: any, e: any): string | null {
+const STRONG_UNAVAILABLE_RE = /private video|video is private|members.only|age.restricted|sign in|login required|has been removed/i;
+const GENERIC_UNAVAILABLE_RE = /unavailable|not available/i;
+export interface UnavailableVote { reason: string; strong: boolean }
+export function unavailableVoteOf(d: any, e: any): UnavailableVote | null {
   if (companionErrorOf(d, e)) return null;
   const msg = errorMessageOf(d, e);
-  return msg && UNAVAILABLE_RE.test(String(msg)) ? String(msg) : null;
+  if (!msg) return null;
+  if (STRONG_UNAVAILABLE_RE.test(msg)) return { reason: String(msg), strong: true };
+  if (GENERIC_UNAVAILABLE_RE.test(msg)) return { reason: String(msg), strong: false };
+  return null;
 }
+export function unavailableReasonOf(d: any, e: any): string | null {
+  return unavailableVoteOf(d, e)?.reason ?? null;
+}
+// 形式（formatStreams / adaptiveFormats 等）を返せた実績のあるインスタンス。
+// 汎用シグナルの票はこの実績がある取得元からのものだけ数える。能力不足の
+// インスタンスが揃って "Video unavailable" を返しても誤判定しないため。
+const provenHosts: Set<string> = __g.__mugiProvenHosts || (__g.__mugiProvenHosts = new Set());
+export function isProvenFormatHost(baseUrl: string): boolean { return provenHosts.has(baseUrl); }
+export function markProvenFormatHost(baseUrl: string) { provenHosts.add(baseUrl); }
 // 1回の走査で「combined（音声付きMP4）で実物確認OK」「形式は何でも実物確認OK」
 // 「未確認だが形式はある」の順に最良のものを探す。
 // excludeHosts はプレイヤーが実際に再生失敗した取得元（Choco-Tube-Plus の exclude 方式）。
 // 完全には外さず走査の最後尾に回す（学校で通るのがその1件だけ、という場合の保険）。
-async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()): Promise<InvVideoResult | null> {
+// export は単体テスト用（判定ロジックを実コードのまま検証するため）
+export async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()): Promise<InvVideoResult | null> {
   const endpoints = await getInvEndpoints();
   // companion 無しインスタンスは動画取得では大きく後回しにする（メタ取得には使い続ける）
   const ordered = orderForVideoScan(endpoints, excludeHosts);
-  let unavailableCount = 0;
-  let unavailableReason = '';
+  // 「再生不可」の票はインスタンス単位（distinct）で数える。以前は単純カウンタで、
+  // 単独リトライが先頭2件（バッチで既に数えた取得元）を再び数えてしまい、
+  // distinct では2件の申告が「3件以上」に化けて誤判定していた（2026-11-19 実地）。
+  const strongVotes = new Map<string, string>();
+  const genericVotes = new Map<string, string>();
   let companionCount = 0;
   let companionReason = '';
   const probeOf = (d: any) => d.formatStreams?.[0]?.url
@@ -413,6 +435,7 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
   const hasAny = (d: any) => hasCombined(d) || !!d?.adaptiveFormats?.length || !!d?.dashUrl || !!d?.hlsUrl;
   let firstUnverified: InvVideoResult | null = null;
   const anyCandidates: { ep: ApiEndpoint; d: any }[] = [];
+  const probedCandidates = new Set<string>();
   const tryProbe = async (ep: ApiEndpoint, d: any): Promise<boolean> => {
     const probe = probeOf(d);
     if (!probe) return false;
@@ -421,26 +444,28 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
     if (ok) noteInstanceSuccess(ep.baseUrl);
     return ok;
   };
-  // 並列バッチ（4件ずつ・最大12件）。並列度を抑えるのは、同時接続が多いと
-  // かえって各インスタンスの応答が遅くなりタイムアウトが増えるため。
-  for (let offset = 0; offset < Math.min(ordered.length, 12); offset += 4) {
-    const batch = ordered.slice(offset, offset + 4);
+  const recordVote = (ep: ApiEndpoint, d: any, e: any) => {
+    const vote = unavailableVoteOf(d, e);
+    if (!vote) return;
+    if (vote.strong) strongVotes.set(ep.baseUrl, vote.reason);
+    else genericVotes.set(ep.baseUrl, vote.reason);
+  };
+  // 1バッチ分の取得・分類・combined 実物確認。確認OKならその結果を返す。
+  // companion エラーは「再生不可」票に数えず、そのインスタンスの取得失敗として扱う。
+  const processBatch = async (batch: ApiEndpoint[], timeoutMs: number): Promise<InvVideoResult | null> => {
     const settled = await Promise.all(batch.map(async (ep) => {
       try {
-        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
-        if (hasAny(d)) { clearNoCompanionInstance(ep.baseUrl); return { ep, d }; }
-        // companion エラーは「再生不可」票に数えず、そのインスタンスの取得失敗として扱う
+        const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, timeoutMs);
+        if (hasAny(d)) { clearNoCompanionInstance(ep.baseUrl); markProvenFormatHost(ep.baseUrl); return { ep, d }; }
         const comp = companionErrorOf(d, null);
         if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); return null; }
-        const reason = unavailableReasonOf(d, null);
-        if (reason) { unavailableCount++; unavailableReason = reason; }
+        recordVote(ep, d, null);
         return null;
       } catch (e: any) {
         noteFailure(ep.baseUrl, e);
         const comp = companionErrorOf(null, e);
         if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); return null; }
-        const reason = unavailableReasonOf(null, e);
-        if (reason) { unavailableCount++; unavailableReason = reason; }
+        recordVote(ep, null, e);
         return null;
       }
     }));
@@ -448,49 +473,87 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
     for (const c of candidates) {
       if (!firstUnverified) firstUnverified = { data: c.d, source: `invidious:${c.ep.baseUrl}`, verified: false };
       if (hasCombined(c.d)) {
+        probedCandidates.add(c.ep.baseUrl);
         if (await tryProbe(c.ep, c.d)) return { data: c.d, source: `invidious:${c.ep.baseUrl}`, verified: true };
       } else {
         anyCandidates.push(c);
       }
     }
+    return null;
+  };
+  // adaptive/DASH/HLS 候補の実物確認（未確認のものを最大4件まで）
+  const probeAnyCandidates = async (): Promise<InvVideoResult | null> => {
+    let probed = 0;
+    for (const c of anyCandidates) {
+      if (probed >= 4) break;
+      if (probedCandidates.has(c.ep.baseUrl)) continue;
+      probedCandidates.add(c.ep.baseUrl); probed++;
+      if (await tryProbe(c.ep, c.d)) return { data: c.d, source: `invidious:${c.ep.baseUrl}`, verified: true };
+    }
+    return null;
+  };
+  // 並列バッチ（4件ずつ・最大12件）。並列度を抑えるのは、同時接続が多いと
+  // かえって各インスタンスの応答が遅くなりタイムアウトが増えるため。
+  const MAIN_SWEEP = Math.min(ordered.length, 12);
+  for (let offset = 0; offset < MAIN_SWEEP; offset += 4) {
+    const verified = await processBatch(ordered.slice(offset, offset + 4), 12000);
+    if (verified) return verified;
   }
   // combined で確認が取れなかったら、adaptive/DASH/HLS の候補を確認する
-  for (const c of anyCandidates.slice(0, 4)) {
-    if (await tryProbe(c.ep, c.d)) return { data: c.d, source: `invidious:${c.ep.baseUrl}`, verified: true };
-  }
+  const anyVerified = await probeAnyCandidates();
+  if (anyVerified) return anyVerified;
   // 最後に、優先順の先頭だけを単独で（並列の競合なしに）もう一度試す。
   // 並列バースト中はタイムアウトしていたインスタンスが、単独だと通ることがある。
   // 除外指定された取得元はここでは試さない（プレイヤーが実測で失敗した先のため）。
+  // ここでの票は Map に上書きされるだけで増えない（distinct 維持）。
   const soloTargets = ordered.filter(ep => !excludeHosts.has(ep.baseUrl)).slice(0, 2);
   for (const ep of soloTargets) {
     try {
       const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
       if (hasAny(d)) {
         clearNoCompanionInstance(ep.baseUrl);
+        markProvenFormatHost(ep.baseUrl);
+        if (!firstUnverified) firstUnverified = { data: d, source: `invidious:${ep.baseUrl}`, verified: false };
         if (await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
       }
       const comp = companionErrorOf(d, null);
       if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); }
-      else {
-        const reason = unavailableReasonOf(d, null);
-        if (reason) { unavailableCount++; unavailableReason = reason; }
-      }
+      else recordVote(ep, d, null);
     } catch (e: any) {
       noteFailure(ep.baseUrl, e);
       const comp = companionErrorOf(null, e);
       if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); }
-      else {
-        const reason = unavailableReasonOf(null, e);
-        if (reason) { unavailableCount++; unavailableReason = reason; }
-      }
+      else recordVote(ep, null, e);
     }
   }
-  // 形式を返した取得元が1件もなく、3件以上が「再生不可」と申告したら動画側の状態として確定。
-  // 呼び出し側は再スイープや別経路を無駄に回さず、即フォールバックへ進める。
-  if (!firstUnverified && unavailableCount >= 3) {
-    const err: any = new Error(`video unavailable: ${unavailableReason}`);
-    err.unavailable = unavailableReason || 'Video unavailable';
-    throw err;
+  // 形式が1件も取れていない場合のみ、未試行の取得元（13件目以降）も尽くす。
+  // 先頭側の申告だけで確定すると、後方で形式を返せる取得元がいても誤判定に
+  // なるため、「再生不可」の確定は掃引を尽くした後でのみ行う。
+  if (!firstUnverified && ordered.length > MAIN_SWEEP) {
+    for (let offset = MAIN_SWEEP; offset < ordered.length; offset += 4) {
+      const verified = await processBatch(ordered.slice(offset, offset + 4), 7000);
+      if (verified) return verified;
+    }
+    const extVerified = await probeAnyCandidates();
+    if (extVerified) return extVerified;
+  }
+  // 「再生不可」の確定条件（掃引を尽くして形式ゼロのときだけ評価する）:
+  // - 強いシグナル（非公開・年齢制限等）は distinct 2件以上
+  // - 汎用シグナル（"Video unavailable" 等）は、形式を返せた実績のある
+  //   取得元からの distinct 3件以上
+  // どちらにも届かなければ確定せず、呼び出し側の後段（Piped / youtubei）に委ねる。
+  if (!firstUnverified) {
+    let reason = '';
+    if (strongVotes.size >= 2) reason = [...strongVotes.values()][0];
+    else {
+      const provenGeneric = [...genericVotes.keys()].filter(h => provenHosts.has(h));
+      if (provenGeneric.length >= 3) reason = genericVotes.get(provenGeneric[0]) || '';
+    }
+    if (reason) {
+      const err: any = new Error(`video unavailable: ${reason}`);
+      err.unavailable = reason || 'Video unavailable';
+      throw err;
+    }
   }
   // 形式を返した取得元がなく「再生不可」の確定にも至らなかったが、companion エラーが
   // あった場合は「取得元側の都合で全滅」として呼び出し側に伝える。動画のせいにせず、
@@ -539,7 +602,11 @@ export async function getVideo(id: string, fresh = false, excludeHosts: string[]
       video: { videoId: id, title: '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: '' },
       formats: [], captions: [], source: 'invidious', unavailable,
     };
-    setCached(key, out, 300_000); return out;
+    // 「再生不可」の判定結果はキャッシュしない。取得元の顔ぶれと状態は時間で
+    // 変わるため、一度誤判定すると TTL の間ずっと、再生できる動画まで塞いで
+    // しまう（2026-11-19 に note-keys で実地確認）。本物の再生不可なら次回も
+    // 同じ判定になるので、都度取り直してよい。
+    return out;
   }
   if (inv) { const out = toPlayerData(inv.data, inv.source); setCached(key, out, inv.verified ? 300_000 : 30_000); return out; }
   // 第3段階: Piped（デフォルトでは動作するインスタンスなし。設定で追加された場合のみ）

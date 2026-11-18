@@ -57,7 +57,9 @@ export function WatchClient({ videoId }: { videoId: string }) {
     // （別ソース再取得・fresh 再スイープ時はキャッシュを使わない）
     if (reloadKey === 0 && !useFresh && excludeHosts.length === 0) {
       const cached = loadSessionCache<PlayerData>(watchCacheKey(videoId), WATCH_CACHE_TTL);
-      if (cached && cached.formats) { setData(cached); setLoading(false); return () => { cancelled = true; }; }
+      // 「再生不可」「取得元側の制限」の判定は退避しない（使う側でも弾く）。
+      // 取得元の状態は変わるため、判定結果を固定すると誤判定が残り続ける。
+      if (cached && cached.formats && !cached.unavailable && !cached.sourceBlocked) { setData(cached); setLoading(false); return () => { cancelled = true; }; }
     }
     // 取得元インスタンスの成否はタイミングで揺れるため、失敗したら少し待って最大3回まで自動リトライする。
     // 待機は回数で延ばし、少しランダムにずらす（同時リトライの集中とレート制限の悪化を防ぐ。
@@ -81,8 +83,9 @@ export function WatchClient({ videoId }: { videoId: string }) {
           const j = await r.json();
           if (cancelled) return;
           if (!j.error && j.formats) {
-            // 素の取得結果だけを退避する（除外指定つきの結果を次回の素の表示で使うと失敗元を掴み直すため）
-            if (!useFresh && excludeHosts.length === 0) saveSessionCache(watchCacheKey(videoId), j);
+            // 素の取得結果だけを退避する（除外指定つきの結果を次回の素の表示で使うと失敗元を掴み直すため）。
+            // 「再生不可」「取得元側の制限」の判定結果は退避しない（誤判定を固定化しないため）。
+            if (!useFresh && excludeHosts.length === 0 && !j.unavailable && !j.sourceBlocked) saveSessionCache(watchCacheKey(videoId), j);
             setData(j); setLoading(false); return;
           }
           if (i === 2) { setError(j.error || '動画情報を取得できませんでした'); setLoading(false); return; }
