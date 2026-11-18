@@ -188,6 +188,22 @@ function WatchBody({ data, resumeAt, onRequestAlt }: { data: PlayerData; resumeA
       </div>
     );
   }
+  // 取得元側の都合（companion 未導入など）で全滅した場合は、動画のせいにしない文言で
+  // 理由を出し、Education へ逃がす
+  if (data.sourceBlocked) {
+    return (
+      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        <div>
+          <div className="mb-3 rounded-xl border border-amber-900 bg-amber-950/50 p-4 text-sm text-amber-200">
+            取得元側の制限で再生できませんでした（動画自体に問題があるわけではありません）。Education再生で開けるか試せます。
+            <div className="mt-1 text-xs text-amber-300/70">{data.sourceBlocked}</div>
+          </div>
+          <EducationPlayer videoId={data.videoId} title={video.title || '動画'} />
+        </div>
+        <aside />
+      </div>
+    );
+  }
   const { store, update } = useStore();
   const { isFav, toggleFav } = useFavorites();
   const { setMini } = useMini();

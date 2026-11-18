@@ -79,6 +79,20 @@ function isPenalized(baseUrl: string): boolean {
   const p = penalties.get(baseUrl);
   return !!p && p.blockedUntil > Date.now();
 }
+// companion 未導入インスタンスの記録:
+// "Invidious companion is not available" は、インスタンスに companion サービスが
+// 入っていないという取得元側の能力不足であり、動画の「再生不可」ではない。
+// 一度このエラーを返したインスタンスは、少なくともプロセス稼働中は動画取得で
+// 大きく後回しにする（検索・フィード等のメタ取得には引き続き使ってよい）。
+const noCompanion: Set<string> = __g.__mugiNoCompanion || (__g.__mugiNoCompanion = new Set());
+export function isNoCompanionInstance(baseUrl: string): boolean { return noCompanion.has(baseUrl); }
+export function markNoCompanionInstance(baseUrl: string) {
+  noCompanion.add(baseUrl);
+  // 取得失敗としても記録し、スコア上も後回しにする。ペナルティ管理の時間窓ブロックは
+  // メタ取得まで止めてしまうため使わず、動画取得側の降格（このフラグ）に留める
+  scores.set(baseUrl, { ms: 9999, at: Date.now(), failed: true });
+}
+export function clearNoCompanionInstance(baseUrl: string) { noCompanion.delete(baseUrl); }
 function noteFailure(baseUrl: string, e: any) {
   scores.set(baseUrl, { ms: 9999, at: Date.now(), failed: true });
   if (e?.status === 429) {
@@ -98,6 +112,17 @@ function orderByScore(eps: ApiEndpoint[]): ApiEndpoint[] {
     if (fa !== fb) return fa ? 1 : -1;
     return (sa?.ms ?? 1500) - (sb?.ms ?? 1500);
   });
+}
+// 動画取得専用の走査順。通常のスコア順を土台に、companion 無しインスタンスを
+// 大きく後回しにし、プレイヤーが再生失敗した除外指定は従来通り最後尾に回す。
+// メタ取得（検索・フィード等）は orderByScore のままなので、companion 無しでも使える。
+export function orderForVideoScan(eps: ApiEndpoint[], excludeHosts: Set<string>): ApiEndpoint[] {
+  const byScore = orderByScore(eps);
+  return [
+    ...byScore.filter(ep => !excludeHosts.has(ep.baseUrl) && !noCompanion.has(ep.baseUrl)),
+    ...byScore.filter(ep => !excludeHosts.has(ep.baseUrl) && noCompanion.has(ep.baseUrl)),
+    ...byScore.filter(ep => excludeHosts.has(ep.baseUrl)),
+  ];
 }
 async function tryEndpointsFast<T>(endpoints: ApiEndpoint[], fn: (ep: ApiEndpoint) => Promise<T>, timeoutMs = 4000): Promise<{ data: T; source: string }> {
   const enabled = orderByScore(endpoints.filter(e => e.enabled));
@@ -341,12 +366,32 @@ async function verifyStream(url: string, timeoutMs = 4500): Promise<boolean> {
 // 1バッチ目で確認が通らなければ2バッチ目（次の6件）も試す。
 // それでも全滅したら、最初の候補を最後の望みとして返す（ブラウザ側のフォールバックに委ねる）。
 export interface InvVideoResult { data: any; source: string; verified: boolean }
+// エラー応答から理由文字列を取り出す（200応答のJSON error フィールド／HTTPエラー時のボディ両対応）
+function errorMessageOf(d: any, e: any): string {
+  if (typeof d?.error === 'string' && d.error) return d.error;
+  try { return JSON.parse(e?.body || '{}')?.error || ''; } catch { return ''; }
+}
+// companion 未導入エラー: "Invidious companion is not available. Video playback
+// cannot continue. ..." は UNAVAILABLE_RE の "not available" にも一致してしまうが、
+// 意味は正反対（動画ではなくインスタンス側の能力不足）なので、最優先で切り分ける。
+// これを「再生不可」票に数えると、companion 無しインスタンスが複数ヒットしただけで
+// 再生できる動画まで早期に諦めて Education へ落としてしまう（実機で多発を確認）。
+const COMPANION_RE = /companion/i;
+export function companionErrorOf(d: any, e: any): string | null {
+  const msg = errorMessageOf(d, e);
+  if (msg && COMPANION_RE.test(msg)) return msg;
+  // ボディがJSON化されず文字列のまま返る場合にも備える
+  const raw = typeof e?.body === 'string' ? e.body : '';
+  return raw && COMPANION_RE.test(raw) ? raw : null;
+}
 // 「再生不可」の即確定分類（siatube の VIDEO_STREAM_ERROR_CODES を参考）:
 // 1インスタンスの申告だけでは確定しない（地域制限など取得元で結果が違うため）。
 // 複数（3件以上）が独立に同じ申告をしたら、動画側の状態として確定させる。
+// companion エラーはここでは絶対に数えない（上記の通り意味が正反対のため）。
 const UNAVAILABLE_RE = /unavailable|not available|private video|members.only|age.restricted|sign in|login required|has been removed|video is private/i;
-function unavailableReasonOf(d: any, e: any): string | null {
-  const msg = (typeof d?.error === 'string' && d.error) || (() => { try { return JSON.parse(e?.body || '{}')?.error || ''; } catch { return ''; } })();
+export function unavailableReasonOf(d: any, e: any): string | null {
+  if (companionErrorOf(d, e)) return null;
+  const msg = errorMessageOf(d, e);
   return msg && UNAVAILABLE_RE.test(String(msg)) ? String(msg) : null;
 }
 // 1回の走査で「combined（音声付きMP4）で実物確認OK」「形式は何でも実物確認OK」
@@ -355,10 +400,12 @@ function unavailableReasonOf(d: any, e: any): string | null {
 // 完全には外さず走査の最後尾に回す（学校で通るのがその1件だけ、という場合の保険）。
 async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()): Promise<InvVideoResult | null> {
   const endpoints = await getInvEndpoints();
-  const byScore = orderByScore(endpoints);
-  const ordered = [...byScore.filter(ep => !excludeHosts.has(ep.baseUrl)), ...byScore.filter(ep => excludeHosts.has(ep.baseUrl))];
+  // companion 無しインスタンスは動画取得では大きく後回しにする（メタ取得には使い続ける）
+  const ordered = orderForVideoScan(endpoints, excludeHosts);
   let unavailableCount = 0;
   let unavailableReason = '';
+  let companionCount = 0;
+  let companionReason = '';
   const probeOf = (d: any) => d.formatStreams?.[0]?.url
     || d.adaptiveFormats?.find((f: any) => f.url && String(f.type || '').startsWith('video/mp4'))?.url
     || d.adaptiveFormats?.[0]?.url;
@@ -381,12 +428,17 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
     const settled = await Promise.all(batch.map(async (ep) => {
       try {
         const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
-        if (hasAny(d)) return { ep, d };
+        if (hasAny(d)) { clearNoCompanionInstance(ep.baseUrl); return { ep, d }; }
+        // companion エラーは「再生不可」票に数えず、そのインスタンスの取得失敗として扱う
+        const comp = companionErrorOf(d, null);
+        if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); return null; }
         const reason = unavailableReasonOf(d, null);
         if (reason) { unavailableCount++; unavailableReason = reason; }
         return null;
       } catch (e: any) {
         noteFailure(ep.baseUrl, e);
+        const comp = companionErrorOf(null, e);
+        if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); return null; }
         const reason = unavailableReasonOf(null, e);
         if (reason) { unavailableCount++; unavailableReason = reason; }
         return null;
@@ -413,13 +465,24 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
   for (const ep of soloTargets) {
     try {
       const d = await fetchJson(`${ep.baseUrl}/api/v1/videos/${id}?local=true&hl=ja`, 12000);
-      if (hasAny(d) && await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
-      const reason = unavailableReasonOf(d, null);
-      if (reason) { unavailableCount++; unavailableReason = reason; }
+      if (hasAny(d)) {
+        clearNoCompanionInstance(ep.baseUrl);
+        if (await tryProbe(ep, d)) return { data: d, source: `invidious:${ep.baseUrl}`, verified: true };
+      }
+      const comp = companionErrorOf(d, null);
+      if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); }
+      else {
+        const reason = unavailableReasonOf(d, null);
+        if (reason) { unavailableCount++; unavailableReason = reason; }
+      }
     } catch (e: any) {
       noteFailure(ep.baseUrl, e);
-      const reason = unavailableReasonOf(null, e);
-      if (reason) { unavailableCount++; unavailableReason = reason; }
+      const comp = companionErrorOf(null, e);
+      if (comp) { companionCount++; companionReason = comp; markNoCompanionInstance(ep.baseUrl); }
+      else {
+        const reason = unavailableReasonOf(null, e);
+        if (reason) { unavailableCount++; unavailableReason = reason; }
+      }
     }
   }
   // 形式を返した取得元が1件もなく、3件以上が「再生不可」と申告したら動画側の状態として確定。
@@ -427,6 +490,14 @@ async function fetchInvVideo(id: string, excludeHosts: Set<string> = new Set()):
   if (!firstUnverified && unavailableCount >= 3) {
     const err: any = new Error(`video unavailable: ${unavailableReason}`);
     err.unavailable = unavailableReason || 'Video unavailable';
+    throw err;
+  }
+  // 形式を返した取得元がなく「再生不可」の確定にも至らなかったが、companion エラーが
+  // あった場合は「取得元側の都合で全滅」として呼び出し側に伝える。動画のせいにせず、
+  // 後段（Piped / youtubei）を試した上で、専用文言を出すために使う。
+  if (!firstUnverified && companionCount > 0) {
+    const err: any = new Error(`companion not available on sources: ${companionReason}`);
+    err.companionOnly = companionReason || 'Invidious companion is not available';
     throw err;
   }
   return firstUnverified;
@@ -454,9 +525,13 @@ export async function getVideo(id: string, fresh = false, excludeHosts: string[]
   // ただし複数インスタンスが「再生不可」と申告したら即確定し、再スイープも後段も回さない。
   let inv: InvVideoResult | null = null;
   let unavailable = '';
-  for (let attempt = 0; attempt < 2 && !inv && !unavailable; attempt++) {
+  let companionBlocked = '';
+  for (let attempt = 0; attempt < 2 && !inv && !unavailable && !companionBlocked; attempt++) {
     try { inv = await fetchInvVideo(id, exSet); }
-    catch (e: any) { if (e?.unavailable) unavailable = String(e.unavailable); }
+    catch (e: any) {
+      if (e?.unavailable) unavailable = String(e.unavailable);
+      else if (e?.companionOnly) companionBlocked = String(e.companionOnly);
+    }
   }
   if (unavailable) {
     const out: PlayerData = {
@@ -488,8 +563,22 @@ export async function getVideo(id: string, fresh = false, excludeHosts: string[]
     setCached(key, out, 300_000); return out;
   } catch (e) {
     // youtubei も接続元や時間帯で成否が揺れるため、1回だけ試し直す
-    const out = await getVideoViaYoutubei(id);
-    setCached(key, out, 300_000); return out;
+    try {
+      const out = await getVideoViaYoutubei(id);
+      setCached(key, out, 300_000); return out;
+    } catch (e2) {
+      // 全経路が失敗し、Invidious 側の主因が companion 未導入だった場合は、
+      // 動画の「再生不可」とは分けて「取得元側の制限」として返す
+      if (companionBlocked) {
+        const out: PlayerData = {
+          videoId: id,
+          video: { videoId: id, title: '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: '' },
+          formats: [], captions: [], source: 'invidious', sourceBlocked: companionBlocked,
+        };
+        setCached(key, out, 120_000); return out;
+      }
+      throw e2;
+    }
   }
 }
 export async function getChannel(id: string, sort: string): Promise<ChannelInfo> {

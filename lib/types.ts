@@ -52,6 +52,10 @@ export interface PlayerData {
   // 複数の取得元が「再生不可」と返したため即確定した理由（メンバー限定・非公開など）。
   // 付いている場合は formats は空で、クライアントは無駄なリトライをせず Education 等へ進む。
   unavailable?: string;
+  // 取得元側の都合（Invidious companion 未導入のインスタンスばかりで形式が取れなかった等）で
+  // 全滅した理由。動画自体の「再生不可」（unavailable）とは別で、クライアントは
+  // 取得元都合の文言で表示する。
+  sourceBlocked?: string;
 }
 export interface ChannelInfo {
   authorId: string;
