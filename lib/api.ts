@@ -207,21 +207,43 @@ export async function getInvEndpoints(): Promise<ApiEndpoint[]> {
 function pipedEndpoints(): ApiEndpoint[] {
   return defaultEndpoints().filter(e => e.kind === 'piped');
 }
-function invThumb(v: any): string {
+// 取得元インスタンスには、形式URL・音声URL・DASHマニフェスト・サムネイルを
+// 相対URLで返すものがある（実測 2026-11-19: echostreamz は formatStreams /
+// adaptiveFormats が `/videoplayback?...`、サムネイルが `/vi/<id>/mqdefault.jpg`）。
+// クライアント（Html5Player）は format.url をそのまま video.src に入れるため、
+// 相対URLは自サイト（mugi-tube.vercel.app / note-keys.onrender.com）のオリジンに
+// 対して解決されて 404 になり、全形式が読み込み失敗→Education 自動切替になっていた。
+// i234 のように絶対URLを返すインスタンスでは起きないため「取得元で再生可否が違う」
+// 症状になっていた。サーバー側の正規化で、取得元インスタンスのオリジンに対して
+// 絶対化してからクライアントへ渡す。絶対URLは new URL がそのまま返すので無変更。
+// export は単体テスト用。
+export function absolutizeUrl(url: string, baseUrl: string): string {
+  if (!url || !baseUrl) return url;
+  try { return new URL(url, baseUrl).toString(); } catch { return url; }
+}
+// source 文字列（"invidious:https://..." 形式）から取得元の baseUrl を取り出す
+export function baseFromSource(source: string): string {
+  const m = String(source || '').match(/^(?:invidious|piped):(.+)$/);
+  return m ? m[1].replace(/\/$/, '') : '';
+}
+function invThumb(v: any, baseUrl = ''): string {
   const thumbs = v.videoThumbnails || [];
   const best = thumbs.find((t: any) => t.quality === 'medium') || thumbs[thumbs.length - 1] || thumbs[0];
-  return proxyThumb(best?.url || (v.videoId ? `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` : ''));
+  const raw = best?.url || (v.videoId ? `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg` : '');
+  // サムネイルも相対で返ることがある（視聴ページの関連動画サムネイル割れの原因）。
+  // proxyThumb は絶対URL前提（ytimg 判定）なので、先に絶対化してから通す
+  return proxyThumb(baseUrl ? absolutizeUrl(raw, baseUrl) : raw);
 }
 function parsePublished(p: any): string | undefined {
   if (p == null || p === '') return undefined;
   if (typeof p === 'number') { const d = new Date(p * 1000); return isNaN(d.getTime()) ? undefined : d.toISOString(); }
   const d = new Date(p); return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
-function normInvVideo(v: any): Video | null {
+function normInvVideo(v: any, baseUrl = ''): Video | null {
   if (!v?.videoId) return null;
   return {
     videoId: v.videoId, title: v.title || '', description: v.description || '',
-    thumbnail: invThumb(v), author: v.author || '', authorId: v.authorId,
+    thumbnail: invThumb(v, baseUrl), author: v.author || '', authorId: v.authorId,
     viewCount: v.viewCount, publishedAt: parsePublished(v.published),
     duration: v.lengthSeconds, lengthSeconds: v.lengthSeconds,
   };
@@ -249,7 +271,7 @@ export async function searchVideos(query: string, sort: string, page?: string | 
       if (!Array.isArray(d)) throw new Error('search response is not an array');
       return d;
     });
-    const results = (Array.isArray(data) ? data : []).map(normInvVideo).filter(Boolean) as Video[];
+    const results = (Array.isArray(data) ? data : []).map((v: any) => normInvVideo(v, baseFromSource(source))).filter(Boolean) as Video[];
     const out: SearchResponse = { query, results, nextPage: null, source };
     setCached(key, out, 300_000); return out;
   } catch (_) { /* fall through to Piped */ }
@@ -275,7 +297,7 @@ export async function getFeed(): Promise<{ videos: Video[]; source: string }> {
       if (!Array.isArray(d) || !d.length) throw new Error('empty popular feed');
       return d;
     });
-    const videos = (Array.isArray(data) ? data : []).map(normInvVideo).filter(Boolean) as Video[];
+    const videos = (Array.isArray(data) ? data : []).map((v: any) => normInvVideo(v, baseFromSource(source))).filter(Boolean) as Video[];
     // 初回表示は24件に絞る（サムネイル40枚同時読み込みを避ける）
     if (videos.length) { const out = { videos: videos.slice(0, 24), source }; setCached(key, out, 600_000); return out; }
     throw new Error('empty popular feed');
@@ -291,7 +313,7 @@ export async function getSuggestions(query: string): Promise<string[]> {
     return Array.isArray(data?.suggestions) ? data.suggestions : [];
   } catch { return []; }
 }
-function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[]; audios: AudioOption[] } {
+function invFormats(v: any, baseUrl = ''): { formats: VideoFormat[]; captions: CaptionTrack[]; audios: AudioOption[] } {
   const formats: VideoFormat[] = [];
   // formatStreams are MP4 files with audio — preferred, single URL.
   // ?local=true で取得しているので URL はインスタンス自身の /videoplayback 中継になり、
@@ -299,8 +321,10 @@ function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[];
   // 統合形式（音声付き単一ファイル）は分離再生より優先する（安定化パック第2弾）:
   // 同期ズレが原理的に起きず再生開始も速いため、combined フラグを付け、
   // プレイヤー側の並び替えでも最優先に扱う。無い場合のみ分離同期再生になる。
+  // URL はインスタンスによって相対（`/videoplayback?...`）で返ることがあるため、
+  // すべて取得元オリジンに対して絶対化してから渡す（absolutizeUrl のコメント参照）。
   for (const f of v.formatStreams || []) {
-    if (f.url) formats.push({ url: f.url, type: 'mp4', mime: f.type, quality: f.quality, qualityLabel: f.qualityLabel, fps: f.fps, hasAudio: true, combined: true, bitrate: Number(f.bitrate) || undefined });
+    if (f.url) formats.push({ url: absolutizeUrl(f.url, baseUrl), type: 'mp4', mime: f.type, quality: f.quality, qualityLabel: f.qualityLabel, fps: f.fps, hasAudio: true, combined: true, bitrate: Number(f.bitrate) || undefined });
   }
   // adaptiveFormats: 映像と音声が別URL。高画質はこちらにしかないので、
   // 音声候補をビットレート順にすべて保持し（音質選択用）、最も良い音声を
@@ -309,7 +333,7 @@ function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[];
   const adaptives: any[] = Array.isArray(v.adaptiveFormats) ? v.adaptiveFormats : [];
   const audioOptions: AudioOption[] = adaptives.filter((f: any) => f.url && String(f.type || '').startsWith('audio/mp4'))
     .sort((a: any, b: any) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))
-    .map((f: any) => ({ url: f.url as string, bitrate: Number(f.bitrate) || 0, label: `${Math.round((Number(f.bitrate) || 0) / 1000)}kbps` }));
+    .map((f: any) => ({ url: absolutizeUrl(f.url as string, baseUrl), bitrate: Number(f.bitrate) || 0, label: `${Math.round((Number(f.bitrate) || 0) / 1000)}kbps` }));
   const bestAudio = audioOptions[0]?.url;
   const heightOf = (f: any) => { const m = String(f.resolution || '').match(/(\d+)p/); return m ? Number(m[1]) : 0; };
   const videos = adaptives.filter((f: any) => f.url && String(f.type || '').startsWith('video/mp4') && String(f.type || '').includes('avc1'))
@@ -317,16 +341,19 @@ function invFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[];
   const seenHeights = new Set<number>();
   for (const f of videos) {
     const h = heightOf(f); if (!h || seenHeights.has(h)) continue; seenHeights.add(h);
-    formats.push({ url: f.url, type: 'mp4', mime: f.type, quality: f.resolution, qualityLabel: f.resolution, fps: f.fps, hasAudio: false, audioUrl: bestAudio, height: h });
+    formats.push({ url: absolutizeUrl(f.url, baseUrl), type: 'mp4', mime: f.type, quality: f.resolution, qualityLabel: f.resolution, fps: f.fps, hasAudio: false, audioUrl: bestAudio, height: h });
   }
   // DASH manifest (dash.js) — separate audio/video handled by the player library, not as a single URL
-  if (v.dashUrl) formats.push({ url: v.dashUrl, type: 'dash', quality: 'DASH', hasAudio: true });
+  // dashUrl も相対パス（`/api/manifest/dash/id/...`）で返ることがある。絶対化すれば
+  // マニフェスト内の相対URLも dash.js がマニフェストのURL基準で解決できる
+  if (v.dashUrl) formats.push({ url: absolutizeUrl(v.dashUrl, baseUrl), type: 'dash', quality: 'DASH', hasAudio: true });
   // HLS — request local=true so all stages go through the CORS-enabled instance
   if (v.hlsUrl) {
-    const u = v.hlsUrl.includes('local=true') ? v.hlsUrl : `${v.hlsUrl}${v.hlsUrl.includes('?') ? '&' : '?'}local=true`;
+    const abs = absolutizeUrl(v.hlsUrl, baseUrl);
+    const u = abs.includes('local=true') ? abs : `${abs}${abs.includes('?') ? '&' : '?'}local=true`;
     formats.push({ url: u, type: 'hls', quality: 'HLS', hasAudio: true });
   }
-  const captions: CaptionTrack[] = (v.captions || []).filter((c: any) => c.url).map((c: any) => ({ label: c.label, language: c.languageCode, url: c.url }));
+  const captions: CaptionTrack[] = (v.captions || []).filter((c: any) => c.url).map((c: any) => ({ label: c.label, language: c.languageCode, url: absolutizeUrl(c.url, baseUrl) }));
   return { formats, captions, audios: audioOptions };
 }
 function pipedFormats(v: any): { formats: VideoFormat[]; captions: CaptionTrack[] } {
@@ -439,7 +466,9 @@ export async function fetchInvVideo(id: string, excludeHosts: Set<string> = new 
   const tryProbe = async (ep: ApiEndpoint, d: any): Promise<boolean> => {
     const probe = probeOf(d);
     if (!probe) return false;
-    const ok = await verifyStream(probe, 6000);
+    // プローブURLも相対で返ることがある。相対のまま fetch すると例外で常に
+    // 「未確認」になり、そのインスタンスの結果が信用できないまま使われていた
+    const ok = await verifyStream(absolutizeUrl(probe, ep.baseUrl), 6000);
     scores.set(ep.baseUrl, ok ? { ms: 500, at: Date.now(), failed: false } : { ms: 9999, at: Date.now(), failed: true });
     if (ok) noteInstanceSuccess(ep.baseUrl);
     return ok;
@@ -574,11 +603,13 @@ export async function getVideo(id: string, fresh = false, excludeHosts: string[]
   if (fresh) { cache.delete(key); cache.delete(`video:${id}`); }
   const hit = getCached<PlayerData>(key); if (hit) return hit;
   const toPlayerData = (data: any, source: string): PlayerData => {
-    const video: Video = normInvVideo(data) || { videoId: id, title: data.title || '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: data.author || '' };
+    // 形式URL・サムネイルの絶対化に使う取得元オリジン（source = "invidious:<baseUrl>"）
+    const base = baseFromSource(source);
+    const video: Video = normInvVideo(data, base) || { videoId: id, title: data.title || '', thumbnail: proxyThumb(`https://i.ytimg.com/vi/${id}/hqdefault.jpg`), author: data.author || '' };
     video.description = data.description || ''; video.authorId = data.authorId; video.viewCount = data.viewCount;
     video.publishedAt = parsePublished(data.published);
-    const { formats, captions, audios } = invFormats(data);
-    const related = (data.recommendedVideos || []).map(normInvVideo).filter(Boolean) as Video[];
+    const { formats, captions, audios } = invFormats(data, base);
+    const related = (data.recommendedVideos || []).map((v: any) => normInvVideo(v, base)).filter(Boolean) as Video[];
     return { videoId: id, video, formats, captions, audios, duration: data.lengthSeconds, source, related };
   };
   // Invidious: 実物確認が通った結果は5分、未確認の結果は30秒だけキャッシュする
@@ -654,9 +685,11 @@ export async function getChannel(id: string, sort: string): Promise<ChannelInfo>
   const invEndpoints = await getInvEndpoints();
   try {
     const { data, source } = await tryEndpoints(invEndpoints, async (ep) => fetchJson(`${ep.baseUrl}/api/v1/channels/${id}?hl=ja`));
-    const videos = (data.latestVideos || []).map(normInvVideo).filter(Boolean) as Video[];
+    const chBase = baseFromSource(source);
+    const videos = (data.latestVideos || []).map((v: any) => normInvVideo(v, chBase)).filter(Boolean) as Video[];
     const sorted = sort === 'views' ? [...videos].sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0)) : sort === 'oldest' ? [...videos].reverse() : videos;
-    const out: ChannelInfo = { authorId: id, author: data.author || '', authorThumbnail: proxyThumb(data.authorThumbnails?.[data.authorThumbnails.length - 1]?.url), description: data.description || '', subscriberCount: data.subCount, totalViews: data.totalViews, videos: sorted, source };
+    const authorThumbRaw = data.authorThumbnails?.[data.authorThumbnails.length - 1]?.url;
+    const out: ChannelInfo = { authorId: id, author: data.author || '', authorThumbnail: proxyThumb(authorThumbRaw ? absolutizeUrl(authorThumbRaw, chBase) : authorThumbRaw), description: data.description || '', subscriberCount: data.subCount, totalViews: data.totalViews, videos: sorted, source };
     setCached(key, out); return out;
   } catch (_) { /* fall through */ }
   const { data, source } = await tryEndpoints(pipedEndpoints(), async (ep) => fetchJson(`${ep.baseUrl}/channel/${id}`));
