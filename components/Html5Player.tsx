@@ -36,10 +36,20 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
   const audioRef = useRef<HTMLAudioElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sorted = sortFormats(filterPlayable(formats));
-  // 前回選んだ画質（高さ）を覚えておき、次回はそれに一番近い形式から始める
+  // 前回選んだ画質（高さ）は、統合形式の中から探すのが先。
+  // サーバーは統合形式のURLだけ実物確認（Range GETで映像が返ること）しているのに、
+  // 旧コードは保存画質に一致する分離形式（adaptive）から試し始めていたため、
+  // 未検証の分離形式が死んでいると統合形式まで届く前に時間を食い、
+  // 止まったまま Education 行きになることがあった。統合形式が無ければ従来通り。
   const [idx, setIdx] = useState(() => {
     try {
       const pref = Number(localStorage.getItem(PREF_HEIGHT_KEY) || 0);
+      if (pref > 0) {
+        const exactCombined = sorted.findIndex(f => f.combined && heightOf(f) === pref);
+        if (exactCombined >= 0) return exactCombined;
+      }
+      const firstCombined = sorted.findIndex(f => f.combined);
+      if (firstCombined >= 0) return firstCombined;
       if (pref > 0) {
         const exact = sorted.findIndex(f => heightOf(f) === pref);
         if (exact >= 0) return exact;
@@ -66,6 +76,13 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
   const [uiVisible, setUiVisible] = useState(true);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hlsRef = useRef<any>(null); const dashRef = useRef<any>(null);
+  // ストール監視用: 最後に映像データの進捗（bytes到着・再生時刻の進行）があった時刻。
+  // error イベントが出ない詰まり（分離形式のストリームが応答しない等）でも、
+  // 一定時間進捗なしなら次形式へ回すためのもの。
+  const progressRef = useRef(Date.now());
+  const loadingRef = useRef(true);
+  const handleErrorRef = useRef<(() => void) | null>(null);
+  useEffect(() => { loadingRef.current = loading; }, [loading]);
   const current = sorted[idx];
   // 音質（音声ビットレート）選択: 分離再生時は audios から選んだ音声を使う。
   // 既定は最高ビットレート（サーバー側で降順ソート済み）
@@ -97,6 +114,7 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
   const attach = useCallback(async () => {
     const v = videoRef.current; if (!v || !current) return;
     cleanup(); setLoading(true); setError('');
+    progressRef.current = Date.now();
     v.playbackRate = rate;
     const a = audioRef.current;
     if (a) {
@@ -125,6 +143,17 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
   }, [idx]);
   useEffect(() => { attach(); return cleanup; }, [attach]);
   useEffect(() => () => cleanup(), []);
+  // 読み込み中の停滞監視: error が出ない詰まりでも、15秒の間に映像データの
+  // 到着も再生時刻の進行もなければ、その形式は失敗扱いにして次形式へ回す。
+  // bytes が届いている遅い読み込み（初回20秒かかることもある）は progress が
+  // 更新されるので誤って切らない。
+  useEffect(() => {
+    if (!loading) return;
+    const t = setTimeout(() => {
+      if (loadingRef.current && Date.now() - progressRef.current > 12000) handleErrorRef.current?.();
+    }, 15000);
+    return () => clearTimeout(t);
+  }, [loading]);
   // 音質を切り替えたら、映像はそのままに音声だけ差し替えて再生位置を同期する
   useEffect(() => {
     const a = audioRef.current; const v = videoRef.current;
@@ -147,6 +176,7 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
     // 現在の再生位置を渡す（別ソースへ切り替えた先で続きから再開するため）
     onAllFailed?.(videoRef.current?.currentTime || 0);
   };
+  useEffect(() => { handleErrorRef.current = handleError; });
   const toggle = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play().catch(() => handleError()); else v.pause(); };
   // シングルタップ=再生/停止、ダブルタップ=左右で±10秒シーク（YouTubeアプリ方式）。
   // シングル判定を少し遅らせるため、クリックはタイマー経由で toggle する
@@ -194,12 +224,13 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
       if (e.key === 'f') wrapRef.current?.requestFullscreen?.(); if (e.key === 'm') { const m = !muted; setMuted(m); applyVolume(volume, m); }
     }} tabIndex={0}>
       <video ref={videoRef} className="h-full w-full" poster={poster} playsInline
-        onPlay={() => { setPlaying(true); syncAudio(true); }}
+        onPlay={() => { setPlaying(true); syncAudio(true); progressRef.current = Date.now(); }}
         onPause={() => { setPlaying(false); syncAudio(); }}
-        onTimeUpdate={e => { setTime(e.currentTarget.currentTime); if (timeRef) timeRef.current = e.currentTarget.currentTime; syncAudio(); }}
+        onTimeUpdate={e => { setTime(e.currentTarget.currentTime); if (timeRef) timeRef.current = e.currentTarget.currentTime; progressRef.current = Date.now(); syncAudio(); }}
+        onProgress={() => { progressRef.current = Date.now(); }}
         onSeeked={() => syncAudio(true)}
         onLoadedMetadata={e => {
-          setDuration(e.currentTarget.duration); setLoading(false);
+          setDuration(e.currentTarget.duration); setLoading(false); progressRef.current = Date.now();
           // 別ソース切替で作り直されたプレイヤーでは、前プレイヤーの再生位置から再開する
           if (startAt && startAt > 0 && !startAppliedRef.current) {
             startAppliedRef.current = true;
@@ -207,7 +238,7 @@ export function Html5Player({ formats, captions, poster, title, startAt, onAllFa
           }
           syncAudio(true);
         }}
-        onWaiting={() => setLoading(true)} onPlaying={() => { setLoading(false); syncAudio(); }}
+        onWaiting={() => setLoading(true)} onPlaying={() => { setLoading(false); progressRef.current = Date.now(); syncAudio(); }}
         onError={() => handleError()}
         onClick={handleVideoClick}
       >
